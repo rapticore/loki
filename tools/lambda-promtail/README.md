@@ -20,13 +20,13 @@ This is a sample template for lambda-promtail - Below is a brief explanation of 
 
 ## Setup process
 
-### Installing dependencies & building the target 
+### Installing dependencies & building the target
 
-In this example we use the built-in `sam build` to automatically download all the dependencies and package our build target.   
-Read more about [SAM Build here](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-cli-command-reference-sam-build.html) 
+In this example we use the built-in `sam build` to automatically download all the dependencies and package our build target.
+Read more about [SAM Build here](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-cli-command-reference-sam-build.html)
 
 The `sam build` command is wrapped inside of the `Makefile`. To execute this simply run
- 
+
 ```shell
 make
 ```
@@ -47,36 +47,45 @@ AWS Lambda Golang runtime requires a flat folder with the executable generated o
 make build
 ```
 
+### Getting AWS CLI keys
+
+Before you try to deploy, make sure to update your AWS config with CLI keys. SAM defaults to `default` profile name, but you can pass a different name during the guided deployment session.
+
+### Deploying
+
 To deploy your application for the first time, first make sure you've set the following parameters in the template:
-- `LogGroup`
-- `PromtailAddress`
-- `ReservedConcurrency`
+- `PromtailAddress` (in the format of `https://<USER_ID>:<API_KEY>@<>URL/api/prom/push` - find more details in Rapticore's Grafana Cloud -> Loki Settings)
+- `ReservedConcurrency` (defaults to 2)
+- `TenantId` (e.g. `demo`)
 
 These can also be set via overrides by passing the following argument to `sam deploy`:
-```
-  --parameter-overrides           Optional. A string that contains AWS
-                                  CloudFormation parameter overrides encoded
-                                  as key=value pairs.For example, 'ParameterKe
-                                  y=KeyPairName,ParameterValue=MyKey Parameter
-                                  Key=InstanceType,ParameterValue=t1.micro' or
-                                  KeyPairName=MyKey InstanceType=t1.micro
-```
 
-Also, if your deployment requires a VPC configuration, make sure to edit the `VpcConfig` field in the `template.yaml` manually.
-
-Then run the following in your shell:
+> Make sure to escape quotes with `\` in `--parameter-overrides` if you see errors.
 
 ```bash
-sam deploy --guided --capabilities CAPABILITY_IAM,CAPABILITY_NAMED_IAM --parameter-overrides PromtailAddress=<>,LogGroup=<>
+sam deploy --guided --profile default \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --config-file "samconfig-example.toml" \
+  --parameter-overrides PromtailAddress=<>,TenantId=<>
 ```
+Also, if your deployment requires a VPC configuration, make sure to edit the `VpcConfig` field in the `template.yaml` manually.
 
-The command will package and deploy your application to AWS, with a series of prompts:
+The command above will package and deploy your application to AWS with a series of prompts, most important ones being:
 
-* **Stack Name**: The name of the stack to deploy to CloudFormation. This should be unique to your account and region, and a good starting point would be something matching your project name.
-* **AWS Region**: The AWS region you want to deploy your app to.
-* **Confirm changes before deploy**: If set to yes, any change sets will be shown to you before execution for manual review. If set to no, the AWS SAM CLI will automatically deploy application changes.
-* **Allow SAM CLI IAM role creation**: Many AWS SAM templates, including this example, create AWS IAM roles required for the AWS Lambda function(s) included to access AWS services. By default, these are scoped down to minimum required permissions. To deploy an AWS CloudFormation stack which creates or modified IAM roles, the `CAPABILITY_IAM` value for `capabilities` must be provided. If permission isn't provided through this prompt, to deploy this example you must explicitly pass `--capabilities CAPABILITY_IAM` to the `sam deploy` command.
-* **Save arguments to samconfig.toml**: If set to yes, your choices will be saved to a configuration file inside the project, so that in the future you can just re-run `sam deploy` without parameters to deploy changes to your application.
+* **Confirm changes before deploy**: Set it to `yes` to verify changes before deployment.
+* **Save arguments to samconfig.toml**: To be able to re-run the script, make sure to pass a name of the file to save the config into, e.g. `dev1.toml`. Next time you deploy the same app into `dev1` environment, you can just re-run `sam deploy` without parameters to deploy changes to your application. **Make sure never to commit that file as it includes secrets, and all toml files are gitignored**.
+
+### Redeploying
+
+:bangbang: CAVEAT:
+
+> I have not found a way to automate this process and make sure anyone can re-deploy to the same stack. I can't commit config files because they include Loki secrets (and this is a public fork). The guided deployment starts by checking whether there's an exisitng S3 bucket where it can backup the files, and creates one with the correct policy if there isn't one.
+>
+> I tried deploying a stack that would create the S3 bucket with the correct policies, and passed it to SAM CLI using correct params, but it keeps failing claiming it can't find the bucket. It may be a bug, and I just gave up on solving it.
+>
+> Let's get back to it when it's a problem. Until then Daria will keep the configs and do the deployments.
+
+You can re-deploy the stack, e.g. when adding additional log groups into the `template.yaml`.
 
 # Appendix
 

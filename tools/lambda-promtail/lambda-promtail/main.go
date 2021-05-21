@@ -53,7 +53,7 @@ func handler(ctx context.Context, ev events.CloudwatchLogsEvent) error {
 		Labels: model.LabelSet{
 			model.LabelName("__aws_cloudwatch_log_group"):  model.LabelValue(data.LogGroup),
 			model.LabelName("__aws_cloudwatch_log_stream"): model.LabelValue(data.LogStream),
-			model.LabelName("__aws_cloudwatch_owner"):      model.LabelValue(data.Owner),
+			model.LabelName("__aws_cloudwatch_owner"):      model.LabelValue(os.Getenv("TENANT_ID")),
 		}.String(),
 		Entries: make([]logproto.Entry, 0, len(data.LogEvents)),
 	}

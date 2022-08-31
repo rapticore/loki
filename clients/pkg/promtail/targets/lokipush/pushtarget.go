@@ -1,29 +1,33 @@
 package lokipush
 
 import (
-	"flag"
+	"bufio"
+	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strings"
 	"time"
 
-	util_log "github.com/cortexproject/cortex/pkg/util/log"
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
-	"github.com/imdario/mergo"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/pkg/relabel"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/relabel"
 	promql_parser "github.com/prometheus/prometheus/promql/parser"
 	"github.com/weaveworks/common/server"
-	"github.com/weaveworks/common/user"
+
+	"github.com/grafana/dskit/tenant"
 
 	"github.com/grafana/loki/clients/pkg/promtail/api"
 	"github.com/grafana/loki/clients/pkg/promtail/scrapeconfig"
+	"github.com/grafana/loki/clients/pkg/promtail/targets/serverutils"
 	"github.com/grafana/loki/clients/pkg/promtail/targets/target"
 
+	"github.com/grafana/loki/pkg/loghttp/push"
 	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/util"
+	util_log "github.com/grafana/loki/pkg/util/log"
 )
 
 type PushTarget struct {
@@ -39,7 +43,8 @@ func NewPushTarget(logger log.Logger,
 	handler api.EntryHandler,
 	relabel []*relabel.Config,
 	jobName string,
-	config *scrapeconfig.PushTargetConfig) (*PushTarget, error) {
+	config *scrapeconfig.PushTargetConfig,
+) (*PushTarget, error) {
 
 	pt := &PushTarget{
 		logger:        logger,
@@ -49,26 +54,14 @@ func NewPushTarget(logger log.Logger,
 		config:        config,
 	}
 
-	// Bit of a chicken and egg problem trying to register the defaults and apply overrides from the loaded config.
-	// First create an empty config and set defaults.
-	defaults := server.Config{}
-	defaults.RegisterFlags(flag.NewFlagSet("empty", flag.ContinueOnError))
-	// Then apply any config values loaded as overrides to the defaults.
-	if err := mergo.Merge(&defaults, config.Server, mergo.WithOverride); err != nil {
-		level.Error(logger).Log("msg", "failed to parse configs and override defaults when configuring push server", "err", err)
-	}
-	// The merge won't overwrite with a zero value but in the case of ports 0 value
-	// indicates the desire for a random port so reset these to zero if the incoming config val is 0
-	if config.Server.HTTPListenPort == 0 {
-		defaults.HTTPListenPort = 0
-	}
-	if config.Server.GRPCListenPort == 0 {
-		defaults.GRPCListenPort = 0
+	mergedServerConfigs, err := serverutils.MergeWithDefaults(config.Server)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse configs and override defaults when configuring loki push target: %w", err)
 	}
 	// Set the config to the new combined config.
-	config.Server = defaults
+	config.Server = mergedServerConfigs
 
-	err := pt.run()
+	err = pt.run()
 	if err != nil {
 		return nil, err
 	}
@@ -84,7 +77,9 @@ func (t *PushTarget) run() error {
 	// We don't want the /debug and /metrics endpoints running
 	t.config.Server.RegisterInstrumentation = false
 
-	util_log.InitLogger(&t.config.Server)
+	// The logger registers a metric which will cause a duplicate registry panic unless we provide an empty registry
+	// The metric created is for counting log lines and isn't likely to be missed.
+	util_log.InitLogger(&t.config.Server, prometheus.NewRegistry())
 
 	srv, err := server.New(t.config.Server)
 	if err != nil {
@@ -92,7 +87,8 @@ func (t *PushTarget) run() error {
 	}
 
 	t.server = srv
-	t.server.HTTP.Handle("/loki/api/v1/push", http.HandlerFunc(t.handle))
+	t.server.HTTP.Path("/loki/api/v1/push").Methods("POST").Handler(http.HandlerFunc(t.handleLoki))
+	t.server.HTTP.Path("/promtail/api/v1/raw").Methods("POST").Handler(http.HandlerFunc(t.handlePlaintext))
 
 	go func() {
 		err := srv.Run()
@@ -104,10 +100,10 @@ func (t *PushTarget) run() error {
 	return nil
 }
 
-func (t *PushTarget) handle(w http.ResponseWriter, r *http.Request) {
+func (t *PushTarget) handleLoki(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
-	userID, _ := user.ExtractOrgID(r.Context())
-	req, err := util.ParseRequest(logger, userID, r)
+	userID, _ := tenant.TenantID(r.Context())
+	req, err := push.ParseRequest(logger, userID, r, nil)
 	if err != nil {
 		level.Warn(t.logger).Log("msg", "failed to parse incoming push request", "err", err.Error())
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -165,6 +161,40 @@ func (t *PushTarget) handle(w http.ResponseWriter, r *http.Request) {
 		level.Warn(t.logger).Log("msg", "at least one entry in the push request failed to process", "err", lastErr.Error())
 		http.Error(w, lastErr.Error(), http.StatusBadRequest)
 		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handlePlaintext handles newline delimited input such as plaintext or NDJSON.
+func (t *PushTarget) handlePlaintext(w http.ResponseWriter, r *http.Request) {
+	entries := t.handler.Chan()
+	defer r.Body.Close()
+	body := bufio.NewReader(r.Body)
+	for {
+		line, err := body.ReadString('\n')
+		if err != nil && err != io.EOF {
+			level.Warn(t.logger).Log("msg", "failed to read incoming push request", "err", err.Error())
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			if err == io.EOF {
+				break
+			}
+			continue
+		}
+		entries <- api.Entry{
+			Labels: t.Labels().Clone(),
+			Entry: logproto.Entry{
+				Timestamp: time.Now(),
+				Line:      line,
+			},
+		}
+		if err == io.EOF {
+			break
+		}
 	}
 
 	w.WriteHeader(http.StatusNoContent)

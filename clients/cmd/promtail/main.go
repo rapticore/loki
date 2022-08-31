@@ -6,25 +6,26 @@ import (
 	"os"
 	"reflect"
 
+	// embed time zone data
+	_ "time/tzdata"
+
 	"k8s.io/klog"
 
-	"github.com/cortexproject/cortex/pkg/util/flagext"
-	util_log "github.com/cortexproject/cortex/pkg/util/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log/level"
+	"github.com/grafana/dskit/flagext"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/version"
 	"github.com/weaveworks/common/logging"
 
-	// embed time zone data
-	_ "time/tzdata"
-
 	"github.com/grafana/loki/clients/pkg/logentry/stages"
 	"github.com/grafana/loki/clients/pkg/promtail"
+	"github.com/grafana/loki/clients/pkg/promtail/client"
 	"github.com/grafana/loki/clients/pkg/promtail/config"
 
-	logutil "github.com/grafana/loki/pkg/util"
+	"github.com/grafana/loki/pkg/util"
 	_ "github.com/grafana/loki/pkg/util/build"
 	"github.com/grafana/loki/pkg/util/cfg"
+	util_log "github.com/grafana/loki/pkg/util/log"
 )
 
 func init() {
@@ -39,6 +40,7 @@ type Config struct {
 	dryRun          bool
 	configFile      string
 	configExpandEnv bool
+	inspect         bool
 }
 
 func (c *Config) RegisterFlags(f *flag.FlagSet) {
@@ -47,6 +49,7 @@ func (c *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&c.logConfig, "log-config-reverse-order", false, "Dump the entire Loki config object at Info log "+
 		"level with the order reversed, reversing the order makes viewing the entries easier in Grafana.")
 	f.BoolVar(&c.dryRun, "dry-run", false, "Start Promtail but print entries instead of sending them to Loki.")
+	f.BoolVar(&c.inspect, "inspect", false, "Allows for detailed inspection of pipeline stages")
 	f.StringVar(&c.configFile, "config.file", "", "yaml file to load")
 	f.BoolVar(&c.configExpandEnv, "config.expand-env", false, "Expands ${var} in config according to the values of the environment variables.")
 	c.Config.RegisterFlags(f)
@@ -63,7 +66,7 @@ func (c *Config) Clone() flagext.Registerer {
 func main() {
 	// Load config, merging config file and CLI flags
 	var config Config
-	if err := cfg.Parse(&config); err != nil {
+	if err := cfg.DefaultUnmarshal(&config, os.Args[1:], flag.CommandLine); err != nil {
 		fmt.Println("Unable to parse config:", err)
 		os.Exit(1)
 	}
@@ -75,36 +78,41 @@ func main() {
 	}
 
 	// Init the logger which will honor the log level set in cfg.Server
-	if reflect.DeepEqual(&config.ServerConfig.Config.LogLevel, &logging.Level{}) {
+	if reflect.DeepEqual(&config.Config.ServerConfig.Config.LogLevel, &logging.Level{}) {
 		fmt.Println("Invalid log level")
 		os.Exit(1)
 	}
-	util_log.InitLogger(&config.ServerConfig.Config)
+	util_log.InitLogger(&config.Config.ServerConfig.Config, prometheus.DefaultRegisterer)
 
 	// Use Stderr instead of files for the klog.
 	klog.SetOutput(os.Stderr)
 
+	if config.inspect {
+		stages.Inspect = true
+	}
+
 	// Set the global debug variable in the stages package which is used to conditionally log
 	// debug messages which otherwise cause huge allocations processing log lines for log messages never printed
-	if config.ServerConfig.Config.LogLevel.String() == "debug" {
+	if config.Config.ServerConfig.Config.LogLevel.String() == "debug" {
 		stages.Debug = true
 	}
 
 	if config.printConfig {
-		err := logutil.PrintConfig(os.Stderr, &config)
+		err := util.PrintConfig(os.Stderr, &config)
 		if err != nil {
 			level.Error(util_log.Logger).Log("msg", "failed to print config to stderr", "err", err.Error())
 		}
 	}
 
 	if config.logConfig {
-		err := logutil.LogConfig(&config)
+		err := util.LogConfig(&config)
 		if err != nil {
 			level.Error(util_log.Logger).Log("msg", "failed to log config object", "err", err.Error())
 		}
 	}
 
-	p, err := promtail.New(config.Config, config.dryRun)
+	clientMetrics := client.NewMetrics(prometheus.DefaultRegisterer, config.Config.Options.StreamLagLabels)
+	p, err := promtail.New(config.Config, clientMetrics, config.dryRun)
 	if err != nil {
 		level.Error(util_log.Logger).Log("msg", "error creating promtail", "error", err)
 		os.Exit(1)

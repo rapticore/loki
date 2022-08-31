@@ -3,7 +3,7 @@ title: Single Store (boltdb-shipper)
 ---
 # Single Store Loki (boltdb-shipper index type)
 
-BoltDB Shipper lets you run Loki without any dependency on NoSQL stores for storing index.
+BoltDB Shipper lets you run Grafana Loki without any dependency on NoSQL stores for storing index.
 It locally stores the index in BoltDB files instead and keeps shipping those files to a shared object store i.e the same object store which is being used for storing chunks.
 It also keeps syncing BoltDB files from shared object store to a configured local directory for getting index entries created by other services of same Loki cluster.
 This helps run Loki with one less dependency and also saves costs in storage since object stores are likely to be much cheaper compared to cost of a hosted NoSQL store or running a self hosted instance of Cassandra.
@@ -73,16 +73,21 @@ Let us talk about more in depth about how both Ingesters and Queriers work when 
 
 ### Ingesters
 
-Ingesters keep writing the index to BoltDB files in `active_index_directory` and BoltDB Shipper keeps looking for new and updated files in that directory every 15 Minutes to upload them to the shared object store.
-When running Loki in clustered mode there could be multiple ingesters serving write requests hence each of them generating BoltDB files locally.
+Ingesters write the index to BoltDB files in `active_index_directory`,
+and the BoltDB Shipper looks for new and updated files in that directory at 1 minute intervals, to upload them to the shared object store.
+When running Loki in microservices mode, there could be multiple ingesters serving write requests.
+Each ingester generates BoltDB files locally.
 
-**Note:** To avoid any loss of index when Ingester crashes it is recommended to run Ingesters as statefulset(when using k8s) with a persistent storage for storing index files.
+**Note:** To avoid any loss of index when an ingester crashes, we recommend running ingesters as a statefulset (when using Kubernetes) with a persistent storage for storing index files.
 
-Another important detail to note is when chunks are flushed they are available for reads in object store instantly while index is not since we only upload them every 15 Minutes with BoltDB shipper.
-Ingesters expose a new RPC for letting Queriers query the Ingester's local index for chunks which were recently flushed but its index might not be available yet with Queriers.
-For all the queries which require chunks to be read from the store, Queriers also query Ingesters over RPC for IDs of chunks which were recently flushed which is to avoid missing any logs from queries.
+When chunks are flushed, they are available for reads in the object store instantly. The index is not available instantly, since we upload every 15 minutes with the BoltDB shipper.
+Ingesters expose a new RPC for letting queriers query the ingester's local index for chunks which were recently flushed, but its index might not be available yet with queriers.
+For all the queries which require chunks to be read from the store, queriers also query ingesters over RPC for IDs of chunks which were recently flushed.
+This avoids missing any logs from queries.
 
 ### Queriers
+
+To avoid running Queriers as a StatefulSet with persistent storage, we recommend running an Index Gateway. An Index Gateway will download and synchronize the index, and it will serve it over gRPC to Queriers and Rulers.
 
 Queriers lazily loads BoltDB files from shared object store to configured `cache_location`.
 When a querier receives a read request, the query range from the request is resolved to period numbers and all the files for those period numbers are downloaded to `cache_location`, if not already.
@@ -92,7 +97,17 @@ Frequency for checking updates can be configured with `resync_interval` config.
 To avoid keeping downloaded index files forever there is a ttl for them which defaults to 24 hours, which means if index files for a period are not used for 24 hours they would be removed from cache location.
 ttl can be configured using `cache_ttl` config.
 
-**Note:** For better read performance and to avoid using node disk it is recommended to run Queriers as statefulset(when using k8s) with persistent storage for downloading and querying index files.
+Within Kubernetes, if you are not using an Index Gateway, we recommend running Queriers as a StatefulSet with persistent storage for downloading and querying index files. This will obtain better read performance, and it will avoid using node disk.
+
+### Index Gateway
+
+An Index Gateway downloads and synchronizes the BoltDB index from the Object Storage in order to serve index queries to the Queriers and Rulers over gRPC.
+This avoids running Queriers and Rulers with a disk for persistence. Disks can become costly in a big cluster.
+
+To run an Index Gateway, configure [StorageConfig](../../../configuration/#storage_config) and set the `-target` CLI flag to `index-gateway`.
+To connect Queriers and Rulers to the Index Gateway, set the address (with gRPC port) of the Index Gateway with the `-boltdb.shipper.index-gateway-client.server-address` CLI flag or its equivalent YAML value under [StorageConfig](../../../configuration/#storage_config).
+
+When using the Index Gateway within Kubernetes, we recommend using a StatefulSet with persistent storage for downloading and querying index files. This can obtain better read performance, avoids [noisy neighbor problems](https://en.wikipedia.org/wiki/Cloud_computing_issues#Performance_interference_and_noisy_neighbors) by not using the node disk, and avoids the time consuming index downloading step on startup after rescheduling to a new node.
 
 ### Write Deduplication disabled
 
@@ -126,7 +141,5 @@ storage_config:
   gcs:
     bucket_name: GCS_BUCKET_NAME
 ```
-
-
 
 

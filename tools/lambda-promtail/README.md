@@ -1,99 +1,85 @@
 # lambda-promtail
 
-This is a sample template for lambda-promtail - Below is a brief explanation of what we have generated for you:
+This is a sample deployment for lambda-promtail - Below is a brief explanation of what we have generated for you:
 
 ```bash
 .
 ├── Makefile                    <-- Make to automate build
+├── Dockerfile                  <-- Uses the AWS Lambda Go base image
 ├── README.md                   <-- This instructions file
-├── hello-world                 <-- Source code for a lambda function
+├── lambda-promtail             <-- Source code for a lambda function
 │   └── main.go                 <-- Lambda function code
-└── template.yaml
 ```
 
 ## Requirements
 
 * AWS CLI already configured with Administrator permission
+* [Terraform](https://www.terraform.io/downloads.html)
+
+If you want to modify the lambda-promtail code you will also need: 
 * [Docker installed](https://www.docker.com/community-edition)
 * [Golang](https://golang.org)
-* SAM CLI - [Install the SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-cli-install.html)
 
 ## Setup process
 
-### Installing dependencies & building the target
+### Building and Packaging
 
-In this example we use the built-in `sam build` to automatically download all the dependencies and package our build target.
-Read more about [SAM Build here](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-cli-command-reference-sam-build.html)
+The provided Makefile has targets `build`, and `clean`.
 
-The `sam build` command is wrapped inside of the `Makefile`. To execute this simply run
+`build` builds the lambda-promtail as a Go static binary. To build the container image properly you should run `docker build . -f tools/lambda-promtail/Dockerfile` from the root of the Loki repository,you can upload this image to your AWS ECR and use via Lambda. `clean` will remove the built Go binary.
 
-```shell
-make
+### Packaging and deployment
+
+The easiest way to deploy to AWS Lambda using the Golang runtime is to use the `lambda-promtail` image by uploading it to your ECR.
+
+Alternatively you can build the Go binary and upload it to Lambda as a zip:
+```bash
+GOOS=linux CGO_ENABLED=0 go build main.go
+zip function.zip main
 ```
 
-### Local development
+To deploy your application for the first time, first make sure you've set the following value in the Terraform file:
+- `WRITE_ADDRESS`
 
-**Invoking function locally
+This is the [Loki Write API](https://grafana.com/docs/loki/latest/api/#post-lokiapiv1push) compatible endpoint that you want to write logs to, either promtail or Loki.
+
+The `lambda-promtail` code picks this value up via an environment variable.
+
+Also, if your deployment requires a [VPC configuration](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_function#vpc_config), make sure to edit the `vpc_config` field in `main.tf` manually. Additonal documentation for the Lambda specific Terraform configuration is [here](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_function#vpc_config).
+
+Then use Terraform to deploy:
 
 ```bash
-make dry-run
+terraform apply -var "<ecr-repo>:<tag>" -var "write_address=https://your-loki-url/loki/api/v1/push" -var "password=<basic-auth-pw>" -var "username=<basic-auth-username>" -var 'log_group_names=["log-group-01", "log-group-02"]' -var 'extra_labels="name1,value1,name2,value2"' -var "tenant_id=<value>"
 ```
 
-## Packaging and deployment
-
-AWS Lambda Golang runtime requires a flat folder with the executable generated on build step. SAM will use `CodeUri` property to know where to look up for the application:
+or CloudFormation:
 
 ```bash
-make build
+aws cloudformation create-stack --stack-name lambda-promtail-stack --template-body file://template.yaml --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM --region us-east-2 --parameters ParameterKey=WriteAddress,ParameterValue=https://your-loki-url/loki/api/v1/push ParameterKey=Username,ParameterValue=<basic-auth-username> ParameterKey=Password,ParameterValue=<basic-auth-pw> ParameterKey=LambdaPromtailImage,ParameterValue=<ecr-repo>:<tag> ParameterKey=ExtraLabels,ParameterValue="name1,value1,name2,value2" ParameterKey=TenantID,ParameterValue=<value>
 ```
-
-### Getting AWS CLI keys
-
-Before you try to deploy, make sure to update your AWS config with CLI keys. SAM defaults to `default` profile name, but you can pass a different name during the guided deployment session.
-
-### Deploying
-
-To deploy your application for the first time, first make sure you've set the following parameters in the template:
-- `PromtailAddress` (in the format of `https://<USER_ID>:<API_KEY>@<>URL/api/prom/push` - find more details in Rapticore's Grafana Cloud -> Loki Settings)
-- `ReservedConcurrency` (defaults to 2)
-- `TenantId` (e.g. `demo`)
-
-These can also be set via overrides by passing the following argument to `sam deploy`:
-
-> Make sure to escape quotes with `\` in `--parameter-overrides` if you see errors.
-
-```bash
-sam deploy --guided --profile default \
-  --capabilities CAPABILITY_NAMED_IAM \
-  --config-file "samconfig-example.toml" \
-  --parameter-overrides PromtailAddress=<>,TenantId=<>
-```
-Also, if your deployment requires a VPC configuration, make sure to edit the `VpcConfig` field in the `template.yaml` manually.
-
-The command above will package and deploy your application to AWS with a series of prompts, most important ones being:
-
-* **Confirm changes before deploy**: Set it to `yes` to verify changes before deployment.
-* **Save arguments to samconfig.toml**: To be able to re-run the script, make sure to pass a name of the file to save the config into, e.g. `dev1.toml`. Next time you deploy the same app into `dev1` environment, you can just re-run `sam deploy` without parameters to deploy changes to your application. **Make sure never to commit that file as it includes secrets, and all toml files are gitignored**.
-
-### Redeploying
-
-:bangbang: CAVEAT:
-
-> I have not found a way to automate this process and make sure anyone can re-deploy to the same stack. I can't commit config files because they include Loki secrets (and this is a public fork). The guided deployment starts by checking whether there's an exisitng S3 bucket where it can backup the files, and creates one with the correct policy if there isn't one.
->
-> I tried deploying a stack that would create the S3 bucket with the correct policies, and passed it to SAM CLI using correct params, but it keeps failing claiming it can't find the bucket. It may be a bug, and I just gave up on solving it.
->
-> Let's get back to it when it's a problem. Until then Daria will keep the configs and do the deployments.
-
-You can re-deploy the stack, e.g. when adding additional log groups into the `template.yaml`.
 
 # Appendix
 
-### Golang installation
+## Golang installation
 
 Please ensure Go 1.x (where 'x' is the latest version) is installed as per the instructions on the official golang website: https://golang.org/doc/install
 
-A quickstart way would be to use Homebrew, chocolatey or your linux package manager.
+For example:
+
+```bash
+GO_VERSION=go1.16.6.linux-amd64.tar.gz
+
+rm -rf /usr/local/bin/go*
+rm -rf /usr/local/go
+curl -O https://storage.googleapis.com/golang/$GO_VERSION
+tar -zxvf $GO_VERSION
+sudo mv go /usr/local/
+rm $GO_VERSION
+ln -s /usr/local/go/bin/* /usr/local/bin/
+```
+
+A quickstart way would be to use Homebrew, chocolatey or your Linux package manager.
 
 #### Homebrew (Mac)
 
@@ -126,4 +112,4 @@ choco upgrade golang
 
 ## Limitations
 - Error handling: If promtail is unresponsive, `lambda-promtail` will drop logs after `retry_count`, which defaults to 2.
-- AWS does not support passing log lines over 256kb to lambdas.
+- AWS CloudWatch [quotas](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/cloudwatch_limits_cwl.html) state that the event size is limited to 256kb. `256 KB (maximum). This quota can't be changed.`

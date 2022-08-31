@@ -1,15 +1,19 @@
 package log
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
-	"regexp"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/grafana/loki/pkg/logql/log/jsonexpr"
 	"github.com/grafana/loki/pkg/logql/log/logfmt"
+	"github.com/grafana/loki/pkg/logql/log/pattern"
 	"github.com/grafana/loki/pkg/logqlmodel"
 
+	"github.com/grafana/regexp"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/prometheus/common/model"
 )
@@ -26,22 +30,26 @@ var (
 	_ Stage = &RegexpParser{}
 	_ Stage = &LogfmtParser{}
 
-	errMissingCapture = errors.New("at least one named capture must be supplied")
+	errUnexpectedJSONObject = fmt.Errorf("expecting json object(%d), but it is not", jsoniter.ObjectValue)
+	errMissingCapture       = errors.New("at least one named capture must be supplied")
 )
 
 type JSONParser struct {
 	buf []byte // buffer used to build json keys
 	lbs *LabelsBuilder
+
+	keys internedStringSet
 }
 
 // NewJSONParser creates a log stage that can parse a json log line and add properties as labels.
 func NewJSONParser() *JSONParser {
 	return &JSONParser{
-		buf: make([]byte, 0, 1024),
+		buf:  make([]byte, 0, 1024),
+		keys: internedStringSet{},
 	}
 }
 
-func (j *JSONParser) Process(line []byte, lbs *LabelsBuilder) ([]byte, bool) {
+func (j *JSONParser) Process(_ int64, line []byte, lbs *LabelsBuilder) ([]byte, bool) {
 	if lbs.ParserLabelHints().NoLabels() {
 		return line, true
 	}
@@ -54,6 +62,7 @@ func (j *JSONParser) Process(line []byte, lbs *LabelsBuilder) ([]byte, bool) {
 
 	if err := j.readObject(it); err != nil {
 		lbs.SetErr(errJSON)
+		lbs.SetErrorDetails(err.Error())
 		return line, true
 	}
 	return line, true
@@ -62,7 +71,7 @@ func (j *JSONParser) Process(line []byte, lbs *LabelsBuilder) ([]byte, bool) {
 func (j *JSONParser) readObject(it *jsoniter.Iterator) error {
 	// we only care about object and values.
 	if nextType := it.WhatIsNext(); nextType != jsoniter.ObjectValue {
-		return fmt.Errorf("expecting json object(%d), got %d", jsoniter.ObjectValue, nextType)
+		return errUnexpectedJSONObject
 	}
 	_ = it.ReadMapCB(j.parseMap(""))
 	if it.Error != nil && it.Error != io.EOF {
@@ -106,7 +115,7 @@ func (j *JSONParser) nextKeyPrefix(prefix, field string) (string, bool) {
 	j.buf = append(j.buf, byte(jsonSpacer))
 	j.buf = append(j.buf, sanitizeLabelKey(field, false)...)
 	// if matches keep going
-	if j.lbs.ParserLabelHints().ShouldExtractPrefix(string(j.buf)) {
+	if j.lbs.ParserLabelHints().ShouldExtractPrefix(unsafeGetString(j.buf)) {
 		return string(j.buf), true
 	}
 	return "", false
@@ -115,17 +124,21 @@ func (j *JSONParser) nextKeyPrefix(prefix, field string) (string, bool) {
 func (j *JSONParser) parseLabelValue(iter *jsoniter.Iterator, prefix, field string) {
 	// the first time we use the field as label key.
 	if len(prefix) == 0 {
-		field = sanitizeLabelKey(field, true)
-		if !j.lbs.ParserLabelHints().ShouldExtract(field) {
-			// we can skip the value
+		key, ok := j.keys.Get(unsafeGetBytes(field), func() (string, bool) {
+			field = sanitizeLabelKey(field, true)
+			if !j.lbs.ParserLabelHints().ShouldExtract(field) {
+				return "", false
+			}
+			if j.lbs.BaseHas(field) {
+				field = field + duplicateSuffix
+			}
+			return field, true
+		})
+		if !ok {
 			iter.Skip()
 			return
-
 		}
-		if j.lbs.BaseHas(field) {
-			field = field + duplicateSuffix
-		}
-		j.lbs.Set(field, readValue(iter))
+		j.lbs.Set(key, readValue(iter))
 		return
 
 	}
@@ -134,14 +147,20 @@ func (j *JSONParser) parseLabelValue(iter *jsoniter.Iterator, prefix, field stri
 	j.buf = append(j.buf, prefix...)
 	j.buf = append(j.buf, byte(jsonSpacer))
 	j.buf = append(j.buf, sanitizeLabelKey(field, false)...)
-	if j.lbs.BaseHas(string(j.buf)) {
-		j.buf = append(j.buf, duplicateSuffix...)
-	}
-	if !j.lbs.ParserLabelHints().ShouldExtract(string(j.buf)) {
+	key, ok := j.keys.Get(j.buf, func() (string, bool) {
+		if j.lbs.BaseHas(string(j.buf)) {
+			j.buf = append(j.buf, duplicateSuffix...)
+		}
+		if !j.lbs.ParserLabelHints().ShouldExtract(string(j.buf)) {
+			return "", false
+		}
+		return string(j.buf), true
+	})
+	if !ok {
 		iter.Skip()
 		return
 	}
-	j.lbs.Set(string(j.buf), readValue(iter))
+	j.lbs.Set(key, readValue(iter))
 }
 
 func (j *JSONParser) RequiredLabelNames() []string { return []string{} }
@@ -149,7 +168,12 @@ func (j *JSONParser) RequiredLabelNames() []string { return []string{} }
 func readValue(iter *jsoniter.Iterator) string {
 	switch iter.WhatIsNext() {
 	case jsoniter.StringValue:
-		return iter.ReadString()
+		v := iter.ReadString()
+		// the rune error replacement is rejected by Prometheus, so we skip it.
+		if strings.ContainsRune(v, utf8.RuneError) {
+			return ""
+		}
+		return v
 	case jsoniter.NumberValue:
 		return iter.ReadNumber().String()
 	case jsoniter.BoolValue:
@@ -163,20 +187,11 @@ func readValue(iter *jsoniter.Iterator) string {
 	}
 }
 
-func addLabel(lbs *LabelsBuilder, key, value string) {
-	key = sanitizeLabelKey(key, true)
-	if len(key) == 0 {
-		return
-	}
-	if lbs.BaseHas(key) {
-		key = fmt.Sprintf("%s%s", key, duplicateSuffix)
-	}
-	lbs.Set(key, value)
-}
-
 type RegexpParser struct {
 	regex     *regexp.Regexp
 	nameIndex map[int]string
+
+	keys internedStringSet
 }
 
 // NewRegexpParser creates a new log stage that can extract labels from a log line using a regex expression.
@@ -209,21 +224,27 @@ func NewRegexpParser(re string) (*RegexpParser, error) {
 	return &RegexpParser{
 		regex:     regex,
 		nameIndex: nameIndex,
+		keys:      internedStringSet{},
 	}, nil
 }
 
-func mustNewRegexParser(re string) *RegexpParser {
-	r, err := NewRegexpParser(re)
-	if err != nil {
-		panic(err)
-	}
-	return r
-}
-
-func (r *RegexpParser) Process(line []byte, lbs *LabelsBuilder) ([]byte, bool) {
+func (r *RegexpParser) Process(_ int64, line []byte, lbs *LabelsBuilder) ([]byte, bool) {
 	for i, value := range r.regex.FindSubmatch(line) {
 		if name, ok := r.nameIndex[i]; ok {
-			addLabel(lbs, name, string(value))
+			key, ok := r.keys.Get(unsafeGetBytes(name), func() (string, bool) {
+				sanitize := sanitizeLabelKey(name, true)
+				if len(sanitize) == 0 {
+					return "", false
+				}
+				if lbs.BaseHas(sanitize) {
+					sanitize = fmt.Sprintf("%s%s", sanitize, duplicateSuffix)
+				}
+				return sanitize, true
+			})
+			if !ok {
+				continue
+			}
+			lbs.Set(key, string(value))
 		}
 	}
 	return line, true
@@ -232,32 +253,51 @@ func (r *RegexpParser) Process(line []byte, lbs *LabelsBuilder) ([]byte, bool) {
 func (r *RegexpParser) RequiredLabelNames() []string { return []string{} }
 
 type LogfmtParser struct {
-	dec *logfmt.Decoder
+	dec  *logfmt.Decoder
+	keys internedStringSet
 }
 
 // NewLogfmtParser creates a parser that can extract labels from a logfmt log line.
 // Each keyval is extracted into a respective label.
 func NewLogfmtParser() *LogfmtParser {
 	return &LogfmtParser{
-		dec: logfmt.NewDecoder(nil),
+		dec:  logfmt.NewDecoder(nil),
+		keys: internedStringSet{},
 	}
 }
 
-func (l *LogfmtParser) Process(line []byte, lbs *LabelsBuilder) ([]byte, bool) {
+func (l *LogfmtParser) Process(_ int64, line []byte, lbs *LabelsBuilder) ([]byte, bool) {
 	if lbs.ParserLabelHints().NoLabels() {
 		return line, true
 	}
 	l.dec.Reset(line)
 	for l.dec.ScanKeyval() {
-		if !lbs.ParserLabelHints().ShouldExtract(sanitizeLabelKey(string(l.dec.Key()), true)) {
+		key, ok := l.keys.Get(l.dec.Key(), func() (string, bool) {
+			sanitized := sanitizeLabelKey(string(l.dec.Key()), true)
+			if !lbs.ParserLabelHints().ShouldExtract(sanitized) {
+				return "", false
+			}
+			if len(sanitized) == 0 {
+				return "", false
+			}
+			if lbs.BaseHas(sanitized) {
+				sanitized = fmt.Sprintf("%s%s", sanitized, duplicateSuffix)
+			}
+			return sanitized, true
+		})
+		if !ok {
 			continue
 		}
-		key := string(l.dec.Key())
-		val := string(l.dec.Value())
-		addLabel(lbs, key, val)
+		val := l.dec.Value()
+		// the rune error replacement is rejected by Prometheus, so we skip it.
+		if bytes.ContainsRune(val, utf8.RuneError) {
+			val = nil
+		}
+		lbs.Set(key, string(val))
 	}
 	if l.dec.Err() != nil {
 		lbs.SetErr(errLogfmt)
+		lbs.SetErrorDetails(l.dec.Err().Error())
 		return line, true
 	}
 	return line, true
@@ -265,8 +305,53 @@ func (l *LogfmtParser) Process(line []byte, lbs *LabelsBuilder) ([]byte, bool) {
 
 func (l *LogfmtParser) RequiredLabelNames() []string { return []string{} }
 
+type PatternParser struct {
+	matcher pattern.Matcher
+	names   []string
+}
+
+func NewPatternParser(pn string) (*PatternParser, error) {
+	m, err := pattern.New(pn)
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range m.Names() {
+		if !model.LabelName(name).IsValid() {
+			return nil, fmt.Errorf("invalid capture label name '%s'", name)
+		}
+	}
+	return &PatternParser{
+		matcher: m,
+		names:   m.Names(),
+	}, nil
+}
+
+func (l *PatternParser) Process(_ int64, line []byte, lbs *LabelsBuilder) ([]byte, bool) {
+	if lbs.ParserLabelHints().NoLabels() {
+		return line, true
+	}
+	matches := l.matcher.Matches(line)
+	names := l.names[:len(matches)]
+	for i, m := range matches {
+		name := names[i]
+		if !lbs.parserKeyHints.ShouldExtract(name) {
+			continue
+		}
+		if lbs.BaseHas(name) {
+			name = name + duplicateSuffix
+		}
+
+		lbs.Set(name, string(m))
+	}
+	return line, true
+}
+
+func (l *PatternParser) RequiredLabelNames() []string { return []string{} }
+
 type JSONExpressionParser struct {
 	expressions map[string][]interface{}
+
+	keys internedStringSet
 }
 
 func NewJSONExpressionParser(expressions []JSONExpression) (*JSONExpressionParser, error) {
@@ -287,10 +372,11 @@ func NewJSONExpressionParser(expressions []JSONExpression) (*JSONExpressionParse
 
 	return &JSONExpressionParser{
 		expressions: paths,
+		keys:        internedStringSet{},
 	}, nil
 }
 
-func (j *JSONExpressionParser) Process(line []byte, lbs *LabelsBuilder) ([]byte, bool) {
+func (j *JSONExpressionParser) Process(_ int64, line []byte, lbs *LabelsBuilder) ([]byte, bool) {
 	if lbs.ParserLabelHints().NoLabels() {
 		return line, true
 	}
@@ -302,12 +388,14 @@ func (j *JSONExpressionParser) Process(line []byte, lbs *LabelsBuilder) ([]byte,
 
 	for identifier, paths := range j.expressions {
 		result := jsoniter.ConfigFastest.Get(line, paths...).ToString()
+		key, _ := j.keys.Get(unsafeGetBytes(identifier), func() (string, bool) {
+			if lbs.BaseHas(identifier) {
+				identifier = identifier + duplicateSuffix
+			}
+			return identifier, true
+		})
 
-		if lbs.BaseHas(identifier) {
-			identifier = identifier + duplicateSuffix
-		}
-
-		lbs.Set(identifier, result)
+		lbs.Set(key, result)
 	}
 
 	return line, true
@@ -317,6 +405,8 @@ func (j *JSONExpressionParser) RequiredLabelNames() []string { return []string{}
 
 type UnpackParser struct {
 	lbsBuffer []string
+
+	keys internedStringSet
 }
 
 // NewUnpackParser creates a new unpack stage.
@@ -326,12 +416,13 @@ type UnpackParser struct {
 func NewUnpackParser() *UnpackParser {
 	return &UnpackParser{
 		lbsBuffer: make([]string, 0, 16),
+		keys:      internedStringSet{},
 	}
 }
 
 func (UnpackParser) RequiredLabelNames() []string { return []string{} }
 
-func (u *UnpackParser) Process(line []byte, lbs *LabelsBuilder) ([]byte, bool) {
+func (u *UnpackParser) Process(_ int64, line []byte, lbs *LabelsBuilder) ([]byte, bool) {
 	if lbs.ParserLabelHints().NoLabels() {
 		return line, true
 	}
@@ -342,6 +433,7 @@ func (u *UnpackParser) Process(line []byte, lbs *LabelsBuilder) ([]byte, bool) {
 	entry, err := u.unpack(it, line, lbs)
 	if err != nil {
 		lbs.SetErr(errJSON)
+		lbs.SetErrorDetails(err.Error())
 		return line, true
 	}
 	return entry, true
@@ -350,7 +442,7 @@ func (u *UnpackParser) Process(line []byte, lbs *LabelsBuilder) ([]byte, bool) {
 func (u *UnpackParser) unpack(it *jsoniter.Iterator, entry []byte, lbs *LabelsBuilder) ([]byte, error) {
 	// we only care about object and values.
 	if nextType := it.WhatIsNext(); nextType != jsoniter.ObjectValue {
-		return nil, fmt.Errorf("expecting json object(%d), got %d", jsoniter.ObjectValue, nextType)
+		return nil, errUnexpectedJSONObject
 	}
 	var isPacked bool
 	_ = it.ReadMapCB(func(iter *jsoniter.Iterator, field string) bool {
@@ -365,15 +457,22 @@ func (u *UnpackParser) unpack(it *jsoniter.Iterator, entry []byte, lbs *LabelsBu
 				isPacked = true
 				return true
 			}
-			if !lbs.ParserLabelHints().ShouldExtract(field) {
+			key, ok := u.keys.Get(unsafeGetBytes(field), func() (string, bool) {
+				if !lbs.ParserLabelHints().ShouldExtract(field) {
+					return "", false
+				}
+				if lbs.BaseHas(field) {
+					field = field + duplicateSuffix
+				}
+				return field, true
+			})
+			if !ok {
 				iter.Skip()
 				return true
 			}
-			if lbs.BaseHas(field) {
-				field = field + duplicateSuffix
-			}
+
 			// append to the buffer of labels
-			u.lbsBuffer = append(u.lbsBuffer, field, iter.ReadString())
+			u.lbsBuffer = append(u.lbsBuffer, key, iter.ReadString())
 		default:
 			iter.Skip()
 		}

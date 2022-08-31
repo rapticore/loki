@@ -19,7 +19,8 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-//+build windows
+//go:build windows
+// +build windows
 
 //revive:disable-next-line:var-naming
 // Package win_eventlog Input plugin to collect Windows Event Log messages
@@ -32,11 +33,12 @@ import (
 	"strings"
 	"syscall"
 
-	util_log "github.com/cortexproject/cortex/pkg/util/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log/level"
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/plugins/inputs"
 	"golang.org/x/sys/windows"
+
+	util_log "github.com/grafana/loki/pkg/util/log"
 )
 
 var sampleConfig = `

@@ -56,3 +56,15 @@ func (c *Client) Received() []api.Entry {
 func (c *Client) StopNow() {
 	c.Stop()
 }
+
+func (c *Client) Name() string {
+	return "fake"
+}
+
+// Clear is used to cleanup the buffered received entries, so the same client can be re-used between
+// test cases.
+func (c *Client) Clear() {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	c.received = []api.Entry{}
+}

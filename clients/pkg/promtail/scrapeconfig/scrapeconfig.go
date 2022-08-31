@@ -5,13 +5,17 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/Shopify/sarama"
+	"github.com/grafana/dskit/flagext"
+
+	promconfig "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/discovery"
+	"github.com/prometheus/prometheus/discovery/aws"
 	"github.com/prometheus/prometheus/discovery/azure"
 	"github.com/prometheus/prometheus/discovery/consul"
 	"github.com/prometheus/prometheus/discovery/digitalocean"
 	"github.com/prometheus/prometheus/discovery/dns"
-	"github.com/prometheus/prometheus/discovery/ec2"
 	"github.com/prometheus/prometheus/discovery/file"
 	"github.com/prometheus/prometheus/discovery/gce"
 	"github.com/prometheus/prometheus/discovery/kubernetes"
@@ -20,23 +24,31 @@ import (
 	"github.com/prometheus/prometheus/discovery/openstack"
 	"github.com/prometheus/prometheus/discovery/triton"
 	"github.com/prometheus/prometheus/discovery/zookeeper"
-	"github.com/prometheus/prometheus/pkg/relabel"
+	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/weaveworks/common/server"
 
 	"github.com/grafana/loki/clients/pkg/logentry/stages"
+	"github.com/grafana/loki/clients/pkg/promtail/discovery/consulagent"
 )
 
 // Config describes a job to scrape.
 type Config struct {
-	JobName                string                     `yaml:"job_name,omitempty"`
-	PipelineStages         stages.PipelineStages      `yaml:"pipeline_stages,omitempty"`
-	JournalConfig          *JournalTargetConfig       `yaml:"journal,omitempty"`
-	SyslogConfig           *SyslogTargetConfig        `yaml:"syslog,omitempty"`
-	GcplogConfig           *GcplogTargetConfig        `yaml:"gcplog,omitempty"`
-	PushConfig             *PushTargetConfig          `yaml:"loki_push_api,omitempty"`
-	WindowsConfig          *WindowsEventsTargetConfig `yaml:"windows_events,omitempty"`
-	RelabelConfigs         []*relabel.Config          `yaml:"relabel_configs,omitempty"`
-	ServiceDiscoveryConfig ServiceDiscoveryConfig     `yaml:",inline"`
+	JobName           string                     `yaml:"job_name,omitempty"`
+	PipelineStages    stages.PipelineStages      `yaml:"pipeline_stages,omitempty"`
+	JournalConfig     *JournalTargetConfig       `yaml:"journal,omitempty"`
+	SyslogConfig      *SyslogTargetConfig        `yaml:"syslog,omitempty"`
+	GcplogConfig      *GcplogTargetConfig        `yaml:"gcplog,omitempty"`
+	PushConfig        *PushTargetConfig          `yaml:"loki_push_api,omitempty"`
+	WindowsConfig     *WindowsEventsTargetConfig `yaml:"windows_events,omitempty"`
+	KafkaConfig       *KafkaTargetConfig         `yaml:"kafka,omitempty"`
+	GelfConfig        *GelfTargetConfig          `yaml:"gelf,omitempty"`
+	CloudflareConfig  *CloudflareConfig          `yaml:"cloudflare,omitempty"`
+	HerokuDrainConfig *HerokuDrainTargetConfig   `yaml:"heroku_drain,omitempty"`
+	RelabelConfigs    []*relabel.Config          `yaml:"relabel_configs,omitempty"`
+	// List of Docker service discovery configurations.
+	DockerSDConfigs        []*moby.DockerSDConfig `yaml:"docker_sd_configs,omitempty"`
+	ServiceDiscoveryConfig ServiceDiscoveryConfig `yaml:",inline"`
+	Encoding               string                 `yaml:"encoding,omitempty"`
 }
 
 type ServiceDiscoveryConfig struct {
@@ -48,6 +60,8 @@ type ServiceDiscoveryConfig struct {
 	FileSDConfigs []*file.SDConfig `yaml:"file_sd_configs,omitempty"`
 	// List of Consul service discovery configurations.
 	ConsulSDConfigs []*consul.SDConfig `yaml:"consul_sd_configs,omitempty"`
+	// List of Consul agent service discovery configurations.
+	ConsulAgentSDConfigs []*consulagent.SDConfig `yaml:"consulagent_sd_configs,omitempty"`
 	// List of DigitalOcean service discovery configurations.
 	DigitalOceanSDConfigs []*digitalocean.SDConfig `yaml:"digitalocean_sd_configs,omitempty"`
 	// List of Docker Swarm service discovery configurations.
@@ -63,7 +77,7 @@ type ServiceDiscoveryConfig struct {
 	// List of GCE service discovery configurations.
 	GCESDConfigs []*gce.SDConfig `yaml:"gce_sd_configs,omitempty"`
 	// List of EC2 service discovery configurations.
-	EC2SDConfigs []*ec2.SDConfig `yaml:"ec2_sd_configs,omitempty"`
+	EC2SDConfigs []*aws.EC2SDConfig `yaml:"ec2_sd_configs,omitempty"`
 	// List of OpenStack service discovery configurations.
 	OpenstackSDConfigs []*openstack.SDConfig `yaml:"openstack_sd_configs,omitempty"`
 	// List of Azure service discovery configurations.
@@ -83,6 +97,9 @@ func (cfg ServiceDiscoveryConfig) Configs() (res discovery.Configs) {
 		res = append(res, x)
 	}
 	for _, x := range cfg.ConsulSDConfigs {
+		res = append(res, x)
+	}
+	for _, x := range cfg.ConsulAgentSDConfigs {
 		res = append(res, x)
 	}
 	for _, x := range cfg.DigitalOceanSDConfigs {
@@ -143,12 +160,20 @@ type JournalTargetConfig struct {
 	// Path to a directory to read journal entries from. Defaults to system path
 	// if empty.
 	Path string `yaml:"path"`
+
+	// Journal matches to filter. Character (+) is not supported, only logical AND
+	// matches will be added.
+	Matches string `yaml:"matches"`
 }
 
 // SyslogTargetConfig describes a scrape config that listens for log lines over syslog.
 type SyslogTargetConfig struct {
 	// ListenAddress is the address to listen on for syslog messages.
 	ListenAddress string `yaml:"listen_address"`
+
+	// ListenProtocol is the protocol used to listen for syslog messages.
+	// Must be either `tcp` (default) or `udp`
+	ListenProtocol string `yaml:"listen_protocol"`
 
 	// IdleTimeout is the idle timeout for tcp connections.
 	IdleTimeout time.Duration `yaml:"idle_timeout"`
@@ -165,8 +190,14 @@ type SyslogTargetConfig struct {
 	// timestamp if it's set.
 	UseIncomingTimestamp bool `yaml:"use_incoming_timestamp"`
 
+	// UseRFC5424Message defines whether the full RFC5424 formatted syslog
+	// message should be pushed to Loki
+	UseRFC5424Message bool `yaml:"use_rfc5424_message"`
+
 	// MaxMessageLength sets the maximum limit to the length of syslog messages
 	MaxMessageLength int `yaml:"max_message_length"`
+
+	TLSConfig promconfig.TLSConfig `yaml:"tls_config,omitempty"`
 }
 
 // WindowsEventsTargetConfig describes a scrape config that listen for windows event logs.
@@ -212,12 +243,116 @@ type WindowsEventsTargetConfig struct {
 	Labels model.LabelSet `yaml:"labels"`
 }
 
+type KafkaTargetConfig struct {
+	// Labels optionally holds labels to associate with each log line.
+	Labels model.LabelSet `yaml:"labels"`
+
+	// UseIncomingTimestamp sets the timestamp to the incoming kafka messages
+	// timestamp if it's set.
+	UseIncomingTimestamp bool `yaml:"use_incoming_timestamp"`
+
+	// The list of brokers to connect to kafka (Required).
+	Brokers []string `yaml:"brokers"`
+
+	// The consumer group id (Required).
+	GroupID string `yaml:"group_id"`
+
+	// Kafka Topics to consume (Required).
+	Topics []string `yaml:"topics"`
+
+	// Kafka version. Default to 2.2.1
+	Version string `yaml:"version"`
+
+	// Rebalancing strategy to use. (e.g sticky, roundrobin or range)
+	Assignor string `yaml:"assignor"`
+
+	// Authentication strategy with Kafka brokers
+	Authentication KafkaAuthentication `yaml:"authentication"`
+}
+
+// KafkaAuthenticationType specifies method to authenticate with Kafka brokers
+type KafkaAuthenticationType string
+
+const (
+	// KafkaAuthenticationTypeNone represents using no authentication
+	KafkaAuthenticationTypeNone = "none"
+	// KafkaAuthenticationTypeSSL represents using SSL/TLS to authenticate
+	KafkaAuthenticationTypeSSL = "ssl"
+	// KafkaAuthenticationTypeSASL represents using SASL to authenticate
+	KafkaAuthenticationTypeSASL = "sasl"
+)
+
+// KafkaAuthentication describe the configuration for authentication with Kafka brokers
+type KafkaAuthentication struct {
+	// Type is authentication type
+	// Possible values: none, sasl and ssl (defaults to none).
+	Type KafkaAuthenticationType `yaml:"type"`
+
+	// TLSConfig is used for TLS encryption and authentication with Kafka brokers
+	TLSConfig promconfig.TLSConfig `yaml:"tls_config,omitempty"`
+
+	// SASLConfig is used for SASL authentication with Kafka brokers
+	SASLConfig KafkaSASLConfig `yaml:"sasl_config,omitempty"`
+}
+
+// KafkaSASLConfig describe the SASL configuration for authentication with Kafka brokers
+type KafkaSASLConfig struct {
+	// SASL mechanism. Supports PLAIN, SCRAM-SHA-256 and SCRAM-SHA-512
+	Mechanism sarama.SASLMechanism `yaml:"mechanism"`
+
+	// SASL Username
+	User string `yaml:"user"`
+
+	// SASL Password for the User
+	Password flagext.Secret `yaml:"password"`
+
+	// UseTLS sets whether TLS is used with SASL
+	UseTLS bool `yaml:"use_tls"`
+
+	// TLSConfig is used for SASL over TLS. It is used only when UseTLS is true
+	TLSConfig promconfig.TLSConfig `yaml:",inline"`
+}
+
+// GelfTargetConfig describes a scrape config that read GELF messages on UDP.
+type GelfTargetConfig struct {
+	// ListenAddress is the address to listen on UDP for gelf messages. (Default to `:12201`)
+	ListenAddress string `yaml:"listen_address"`
+
+	// Labels optionally holds labels to associate with each record read from gelf messages.
+	Labels model.LabelSet `yaml:"labels"`
+
+	// UseIncomingTimestamp sets the timestamp to the incoming gelf messages
+	// timestamp if it's set.
+	UseIncomingTimestamp bool `yaml:"use_incoming_timestamp"`
+}
+
+type CloudflareConfig struct {
+	// APIToken is the API key for the Cloudflare account.
+	APIToken string `yaml:"api_token"`
+	// ZoneID is the ID of the zone to use.
+	ZoneID string `yaml:"zone_id"`
+	// Labels optionally holds labels to associate with each record read from cloudflare logs.
+	Labels model.LabelSet `yaml:"labels"`
+	// The amount of workers to use for parsing cloudflare logs. Default to 3.
+	Workers int `yaml:"workers"`
+	// The timerange to fetch for each pull request that will be spread across workers. Default 1m.
+	PullRange model.Duration `yaml:"pull_range"`
+	// Fields to fetch from cloudflare logs.
+	// Default to default fields.
+	// Available fields type:
+	// - default
+	// - minimal
+	// - extended
+	// - all
+	FieldsType string `yaml:"fields_type"`
+}
+
 // GcplogTargetConfig describes a scrape config to pull logs from any pubsub topic.
 type GcplogTargetConfig struct {
 	// ProjectID is the Cloud project id
 	ProjectID string `yaml:"project_id"`
 
-	// Subscription is the scription name we use to pull logs from a pubsub topic.
+	// Subscription is the subscription name we use to pull logs from a pubsub topic.
 	Subscription string `yaml:"subscription"`
 
 	// Labels are the additional labels to be added to log entry while pushing it to Loki server.
@@ -226,6 +361,26 @@ type GcplogTargetConfig struct {
 	// UseIncomingTimestamp represents whether to keep the timestamp same as actual log entry coming in or replace it with
 	// current timestamp at the time of processing.
 	// Its default value(`false`) denotes, replace it with current timestamp at the time of processing.
+	UseIncomingTimestamp bool `yaml:"use_incoming_timestamp"`
+
+	// SubscriptionType decides if the target works with a `pull` or `push` subscription type.
+	// Defaults to `pull` for backwards compatibility reasons.
+	SubscriptionType string `yaml:"subscription_type"`
+
+	// Server is the weaveworks server config for listening connections. Used just for `push` subscription type.
+	Server server.Config `yaml:"server"`
+}
+
+// HerokuDrainTargetConfig describes a scrape config to listen and consume heroku logs, in the HTTPS drain manner.
+type HerokuDrainTargetConfig struct {
+	// Server is the weaveworks server config for listening connections
+	Server server.Config `yaml:"server"`
+
+	// Labels optionally holds labels to associate with each record received on the push api.
+	Labels model.LabelSet `yaml:"labels"`
+
+	// UseIncomingTimestamp sets the timestamp to the incoming heroku log entry timestamp. If false,
+	// promtail will assign the current timestamp to the log entry when it was processed.
 	UseIncomingTimestamp bool `yaml:"use_incoming_timestamp"`
 }
 
@@ -254,7 +409,6 @@ func (c *Config) HasServiceDiscoveryConfig() bool {
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
 func (c *Config) UnmarshalYAML(unmarshal func(interface{}) error) error {
-
 	*c = DefaultScrapeConfig
 
 	type plain Config

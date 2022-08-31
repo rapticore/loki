@@ -1,23 +1,26 @@
-local g = import 'grafana-builder/grafana.libsonnet';
 local utils = import 'mixin-utils/utils.libsonnet';
 
 (import 'dashboard-utils.libsonnet') {
+  local compactor_pod_matcher = if $._config.ssd.enabled then 'container="loki", pod=~"%s-read.*"' % $._config.ssd.pod_prefix_matcher else 'container="compactor"',
+  local compactor_job_matcher = if $._config.ssd.enabled then '%s-read' % $._config.ssd.pod_prefix_matcher else 'compactor',
   grafanaDashboards+::
     {
       'loki-retention.json':
         ($.dashboard('Loki / Retention', uid='retention'))
-        .addClusterSelectorTemplates(false)
+        .addCluster()
+        .addNamespace()
+        .addTag()
         .addLog()
         .addRow(
-          $.row('Ressource Usage')
+          $.row('Resource Usage')
           .addPanel(
-            $.containerCPUUsagePanel('CPU', 'compactor'),
+            $.CPUUsagePanel('CPU', compactor_pod_matcher),
           )
           .addPanel(
-            $.containerMemoryWorkingSetPanel('Memory (workingset)', 'compactor'),
+            $.memoryWorkingSetPanel('Memory (workingset)', compactor_pod_matcher),
           )
           .addPanel(
-            $.goHeapInUsePanel('Memory (go heap inuse)', 'compactor'),
+            $.goHeapInUsePanel('Memory (go heap inuse)', compactor_job_matcher),
           )
 
         )
@@ -76,11 +79,14 @@ local utils = import 'mixin-utils/utils.libsonnet';
         .addRow(
           $.row('')
           .addPanel(
-            $.fromNowPanel('Sweep Lag', 'loki_boltdb_shipper_retention_sweeper_marker_file_processing_current_time')
+            $.panel('Sweeper Lag') +
+            $.queryPanel(['time() - (loki_boltdb_shipper_retention_sweeper_marker_file_processing_current_time{%s} > 0)' % $.namespaceMatcher()], ['lag']) + {
+              yaxes: $.yaxes({ format: 's', min: null }),
+            },
           )
           .addPanel(
             $.panel('Marks Files to Process') +
-            $.queryPanel(['loki_boltdb_shipper_retention_sweeper_marker_files_current{%s}' % $.namespaceMatcher()], ['count']),
+            $.queryPanel(['sum(loki_boltdb_shipper_retention_sweeper_marker_files_current{%s})' % $.namespaceMatcher()], ['count']),
           )
           .addPanel(
             $.panel('Delete Rate Per Status') +
@@ -90,7 +96,7 @@ local utils = import 'mixin-utils/utils.libsonnet';
         .addRow(
           $.row('Logs')
           .addPanel(
-            $.logPanel('Compactor Logs', '{container="compactor", %s}' % $.namespaceMatcher()),
+            $.logPanel('Compactor Logs', '{%s}' % $.jobMatcher(compactor_job_matcher)),
           )
         ),
     },

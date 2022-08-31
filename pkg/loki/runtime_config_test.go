@@ -9,10 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/util/runtimeconfig"
+	"github.com/go-kit/log"
+	"github.com/grafana/dskit/runtimeconfig"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/stretchr/testify/require"
 
 	"github.com/grafana/loki/pkg/validation"
@@ -91,10 +92,10 @@ func newTestOverrides(t *testing.T, yaml string) *validation.Overrides {
 	loader := func(_ io.Reader) (interface{}, error) {
 		return loadRuntimeConfig(strings.NewReader(yaml))
 	}
-	cfg := runtimeconfig.ManagerConfig{
+	cfg := runtimeconfig.Config{
 		ReloadPeriod: 1 * time.Second,
 		Loader:       loader,
-		LoadPath:     path,
+		LoadPath:     []string{path},
 	}
 	flagset := flag.NewFlagSet("", flag.PanicOnError)
 	var defaults validation.Limits
@@ -102,7 +103,8 @@ func newTestOverrides(t *testing.T, yaml string) *validation.Overrides {
 	require.NoError(t, flagset.Parse(nil))
 	validation.SetDefaultLimitsForYAMLUnmarshalling(defaults)
 
-	runtimeConfig, err := runtimeconfig.NewRuntimeConfigManager(cfg, prometheus.DefaultRegisterer)
+	reg := prometheus.NewPedanticRegistry()
+	runtimeConfig, err := runtimeconfig.New(cfg, prometheus.WrapRegistererWithPrefix("loki_", reg), log.NewNopLogger())
 	require.NoError(t, err)
 
 	require.NoError(t, runtimeConfig.StartAsync(context.Background()))
@@ -112,7 +114,19 @@ func newTestOverrides(t *testing.T, yaml string) *validation.Overrides {
 		require.NoError(t, runtimeConfig.AwaitTerminated(context.Background()))
 	}()
 
-	overrides, err := validation.NewOverrides(defaults, tenantLimitsFromRuntimeConfig(runtimeConfig))
+	overrides, err := validation.NewOverrides(defaults, newtenantLimitsFromRuntimeConfig(runtimeConfig))
 	require.NoError(t, err)
 	return overrides
+}
+
+func Test_NoOverrides(t *testing.T) {
+	flagset := flag.NewFlagSet("", flag.PanicOnError)
+
+	var defaults validation.Limits
+	defaults.RegisterFlags(flagset)
+	require.NoError(t, flagset.Parse(nil))
+	validation.SetDefaultLimitsForYAMLUnmarshalling(defaults)
+	overrides, err := validation.NewOverrides(defaults, newtenantLimitsFromRuntimeConfig(nil))
+	require.NoError(t, err)
+	require.Equal(t, time.Duration(defaults.QuerySplitDuration), overrides.QuerySplitDuration("foo"))
 }

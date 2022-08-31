@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/go-kit/kit/log"
+	"github.com/go-kit/log"
 
 	"github.com/grafana/loki/clients/pkg/promtail/client"
 )
@@ -21,10 +21,10 @@ var defaultBufferConfig = bufferConfig{
 }
 
 // NewBuffer makes a new buffered Client.
-func NewBuffer(cfg *config, logger log.Logger) (client.Client, error) {
+func NewBuffer(cfg *config, logger log.Logger, metrics *client.Metrics, streamLagLabels []string) (client.Client, error) {
 	switch cfg.bufferConfig.bufferType {
 	case "dque":
-		return newDque(cfg, logger)
+		return newDque(cfg, logger, metrics, streamLagLabels)
 	default:
 		return nil, fmt.Errorf("failed to parse bufferType: %s", cfg.bufferConfig.bufferType)
 	}

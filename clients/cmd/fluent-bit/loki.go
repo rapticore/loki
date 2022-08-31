@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -9,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/go-logfmt/logfmt"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/prometheus/common/model"
@@ -18,6 +19,8 @@ import (
 
 	"github.com/grafana/loki/clients/pkg/promtail/api"
 	"github.com/grafana/loki/clients/pkg/promtail/client"
+
+	"github.com/grafana/loki/pkg/util"
 
 	"github.com/grafana/loki/pkg/logproto"
 )
@@ -33,8 +36,8 @@ type loki struct {
 	logger log.Logger
 }
 
-func newPlugin(cfg *config, logger log.Logger) (*loki, error) {
-	client, err := NewClient(cfg, logger)
+func newPlugin(cfg *config, logger log.Logger, metrics *client.Metrics) (*loki, error) {
+	client, err := NewClient(cfg, logger, metrics, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -76,7 +79,7 @@ func (l *loki) sendRecord(r map[interface{}]interface{}, ts time.Time) error {
 			return nil
 		}
 	}
-	line, err := createLine(records, l.cfg.lineFormat)
+	line, err := l.createLine(records, l.cfg.lineFormat)
 	if err != nil {
 		return fmt.Errorf("error creating line: %v", err)
 	}
@@ -218,9 +221,21 @@ func removeKeys(records map[string]interface{}, keys []string) {
 	}
 }
 
-func createLine(records map[string]interface{}, f format) (string, error) {
+func (l *loki) createLine(records map[string]interface{}, f format) (string, error) {
 	switch f {
 	case jsonFormat:
+		for k, v := range records {
+			if s, ok := v.(string); ok && (strings.Contains(s, "{") || strings.Contains(s, "[")) {
+				var data interface{}
+				err := json.Unmarshal([]byte(s), &data)
+				if err != nil {
+					// keep this debug as it can be very verbose
+					level.Debug(l.logger).Log("msg", "error unmarshalling json", "err", err)
+					continue
+				}
+				records[k] = data
+			}
+		}
 		js, err := jsoniter.ConfigCompatibleWithStandardLibrary.Marshal(records)
 		if err != nil {
 			return "", err
@@ -255,7 +270,7 @@ func createLine(records map[string]interface{}, f format) (string, error) {
 
 func newLogger(logLevel logging.Level) log.Logger {
 	logger := log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
-	logger = level.NewFilter(logger, logLevel.Gokit)
+	logger = level.NewFilter(logger, util.LogFilter(logLevel.String()))
 	logger = log.With(logger, "caller", log.Caller(3))
 	return logger
 }

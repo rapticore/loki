@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/mitchellh/mapstructure"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -48,7 +48,7 @@ func validateMetricsConfig(cfg MetricsConfig) error {
 		return errors.New(ErrEmptyMetricsStageConfig)
 	}
 	for name, config := range cfg {
-		//If the source is not defined, default to the metric name
+		// If the source is not defined, default to the metric name
 		if config.Source == nil {
 			cp := cfg[name]
 			nm := name
@@ -201,7 +201,7 @@ func (m *metricStage) recordCounter(name string, counter *metric.Counters, label
 		counter.With(labels).Inc()
 	case metric.CounterAdd:
 		f, err := getFloat(v)
-		if err != nil || f < 0 {
+		if err != nil {
 			if Debug {
 				level.Debug(m.logger).Log("msg", "failed to convert extracted value to positive float", "metric", name, "err", err)
 			}
@@ -232,7 +232,7 @@ func (m *metricStage) recordGauge(name string, gauge *metric.Gauges, labels mode
 	switch gauge.Cfg.Action {
 	case metric.GaugeSet:
 		f, err := getFloat(v)
-		if err != nil || f < 0 {
+		if err != nil {
 			if Debug {
 				level.Debug(m.logger).Log("msg", "failed to convert extracted value to positive float", "metric", name, "err", err)
 			}
@@ -245,7 +245,7 @@ func (m *metricStage) recordGauge(name string, gauge *metric.Gauges, labels mode
 		gauge.With(labels).Dec()
 	case metric.GaugeAdd:
 		f, err := getFloat(v)
-		if err != nil || f < 0 {
+		if err != nil {
 			if Debug {
 				level.Debug(m.logger).Log("msg", "failed to convert extracted value to positive float", "metric", name, "err", err)
 			}
@@ -254,7 +254,7 @@ func (m *metricStage) recordGauge(name string, gauge *metric.Gauges, labels mode
 		gauge.With(labels).Add(f)
 	case metric.GaugeSub:
 		f, err := getFloat(v)
-		if err != nil || f < 0 {
+		if err != nil {
 			if Debug {
 				level.Debug(m.logger).Log("msg", "failed to convert extracted value to positive float", "metric", name, "err", err)
 			}
@@ -293,7 +293,6 @@ func (m *metricStage) recordHistogram(name string, histogram *metric.Histograms,
 
 // getFloat will take the provided value and return a float64 if possible
 func getFloat(unk interface{}) (float64, error) {
-
 	switch i := unk.(type) {
 	case float64:
 		return i, nil
@@ -312,7 +311,7 @@ func getFloat(unk interface{}) (float64, error) {
 	case uint:
 		return float64(i), nil
 	case string:
-		return strconv.ParseFloat(i, 64)
+		return getFloatFromString(i)
 	case bool:
 		if i {
 			return float64(1), nil
@@ -321,4 +320,23 @@ func getFloat(unk interface{}) (float64, error) {
 	default:
 		return math.NaN(), fmt.Errorf("can't convert %v to float64", unk)
 	}
+}
+
+// getFloatFromString converts string into float64
+// Two types of string formats are supported:
+//   * strings that represent floating point numbers, e.g., "0.804"
+//   * duration format strings, e.g., "0.5ms", "10h".
+//     Valid time units are "ns", "us", "ms", "s", "m", "h".
+//     Values in this format are converted as a floating point number of seconds.
+//     E.g., "0.5ms" is converted to 0.0005
+func getFloatFromString(str string) (float64, error) {
+	dur, err := strconv.ParseFloat(str, 64)
+	if err != nil {
+		dur, err := time.ParseDuration(str)
+		if err != nil {
+			return 0, err
+		}
+		return dur.Seconds(), nil
+	}
+	return dur, nil
 }

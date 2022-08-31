@@ -1,12 +1,22 @@
+local grafana = import 'grafonnet/grafana.libsonnet';
 local utils = import 'mixin-utils/utils.libsonnet';
 
 (import 'dashboard-utils.libsonnet') {
-  grafanaDashboards+:
+  local index_gateway_pod_matcher = if $._config.ssd.enabled then 'container="loki", pod=~"%s-read.*"' % $._config.ssd.pod_prefix_matcher else 'container="index-gateway"',
+  local index_gateway_job_matcher = if $._config.ssd.enabled then '%s-read' % $._config.ssd.pod_prefix_matcher else 'index-gateway',
+
+  local ingester_pod_matcher = if $._config.ssd.enabled then 'container="loki", pod=~"%s-write.*"' % $._config.ssd.pod_prefix_matcher else 'container="ingester"',
+  local ingester_job_matcher = if $._config.ssd.enabled then '%s-write' % $._config.ssd.pod_prefix_matcher else 'ingester',
+
+  grafanaDashboards+::
     {
       'loki-reads-resources.json':
-        ($.dashboard('Loki / Reads Resources'))
-        .addClusterSelectorTemplates(false)
-        .addRow(
+        ($.dashboard('Loki / Reads Resources', uid='reads-resources'))
+        .addCluster()
+        .addNamespace()
+        .addTag()
+        .addRowIf(
+          $._config.internal_components,
           $.row('Gateway')
           .addPanel(
             $.containerCPUUsagePanel('CPU', 'cortex-gw'),
@@ -18,7 +28,8 @@ local utils = import 'mixin-utils/utils.libsonnet';
             $.goHeapInUsePanel('Memory (go heap inuse)', 'cortex-gw'),
           )
         )
-        .addRow(
+        .addRowIf(
+          !$._config.ssd.enabled,
           $.row('Query Frontend')
           .addPanel(
             $.containerCPUUsagePanel('CPU', 'query-frontend'),
@@ -30,8 +41,22 @@ local utils = import 'mixin-utils/utils.libsonnet';
             $.goHeapInUsePanel('Memory (go heap inuse)', 'query-frontend'),
           )
         )
-        .addRow(
-          $.row('Querier')
+        .addRowIf(
+          !$._config.ssd.enabled,
+          $.row('Query Scheduler')
+          .addPanel(
+            $.containerCPUUsagePanel('CPU', 'query-scheduler'),
+          )
+          .addPanel(
+            $.containerMemoryWorkingSetPanel('Memory (workingset)', 'query-scheduler'),
+          )
+          .addPanel(
+            $.goHeapInUsePanel('Memory (go heap inuse)', 'query-scheduler'),
+          )
+        )
+        .addRowIf(
+          !$._config.ssd.enabled,
+          grafana.row.new('Querier')
           .addPanel(
             $.containerCPUUsagePanel('CPU', 'querier'),
           )
@@ -41,9 +66,6 @@ local utils = import 'mixin-utils/utils.libsonnet';
           .addPanel(
             $.goHeapInUsePanel('Memory (go heap inuse)', 'querier'),
           )
-        )
-        .addRow(
-          $.row('')
           .addPanel(
             $.panel('Disk Writes') +
             $.queryPanel(
@@ -63,25 +85,64 @@ local utils = import 'mixin-utils/utils.libsonnet';
             { yaxes: $.yaxes('Bps') },
           )
           .addPanel(
-            $.panel('Disk Space Utilization') +
-            $.queryPanel('max by(persistentvolumeclaim) (kubelet_volume_stats_used_bytes{%s} / kubelet_volume_stats_capacity_bytes{%s}) and count by(persistentvolumeclaim) (kube_persistentvolumeclaim_labels{%s,label_name=~"querier.*"})' % [$.namespaceMatcher(), $.namespaceMatcher(), $.namespaceMatcher()], '{{persistentvolumeclaim}}') +
-            { yaxes: $.yaxes('percentunit') },
+            $.containerDiskSpaceUtilizationPanel('Disk Space Utilization', 'querier'),
+          )
+        )
+        .addRow(
+          grafana.row.new(if $._config.ssd.enabled then 'Read path' else 'Index Gateway')
+          .addPanel(
+            $.CPUUsagePanel('CPU', index_gateway_pod_matcher),
+          )
+          .addPanel(
+            $.memoryWorkingSetPanel('Memory (workingset)', index_gateway_pod_matcher),
+          )
+          .addPanel(
+            $.goHeapInUsePanel('Memory (go heap inuse)', index_gateway_job_matcher),
+          )
+          .addPanel(
+            $.panel('Disk Writes') +
+            $.queryPanel(
+              'sum by(%s, %s, device) (rate(node_disk_written_bytes_total[$__rate_interval])) + %s' % [$._config.per_node_label, $._config.per_instance_label, $.filterNodeDisk(index_gateway_pod_matcher)],
+              '{{%s}} - {{device}}' % $._config.per_instance_label
+            ) +
+            $.stack +
+            { yaxes: $.yaxes('Bps') },
+          )
+          .addPanel(
+            $.panel('Disk Reads') +
+            $.queryPanel(
+              'sum by(%s, %s, device) (rate(node_disk_read_bytes_total[$__rate_interval])) + %s' % [$._config.per_node_label, $._config.per_instance_label, $.filterNodeDisk(index_gateway_pod_matcher)],
+              '{{%s}} - {{device}}' % $._config.per_instance_label
+            ) +
+            $.stack +
+            { yaxes: $.yaxes('Bps') },
+          )
+          .addPanel(
+            $.containerDiskSpaceUtilizationPanel('Disk Space Utilization', index_gateway_job_matcher),
+          )
+          .addPanel(
+            $.panel('Query Readiness Duration') +
+            $.queryPanel(
+              ['loki_boltdb_shipper_query_readiness_duration_seconds{%s}' % $.namespaceMatcher()], ['duration']
+            ) +
+            { yaxes: $.yaxes('s') },
           )
         )
         .addRow(
           $.row('Ingester')
           .addPanel(
-            $.containerCPUUsagePanel('CPU', 'ingester'),
+            $.CPUUsagePanel('CPU', ingester_pod_matcher),
           )
           .addPanel(
-            $.containerMemoryWorkingSetPanel('Memory (workingset)', 'ingester'),
+            $.memoryWorkingSetPanel('Memory (workingset)', ingester_pod_matcher),
           )
           .addPanel(
-            $.goHeapInUsePanel('Memory (go heap inuse)', 'ingester'),
+            $.goHeapInUsePanel('Memory (go heap inuse)', ingester_job_matcher),
           )
         )
-        .addRow(
-          $.row('Ruler')
+        .addRowIf(
+          !$._config.ssd.enabled,
+          grafana.row.new('Ruler')
           .addPanel(
             $.panel('Rules') +
             $.queryPanel(
@@ -92,9 +153,6 @@ local utils = import 'mixin-utils/utils.libsonnet';
           .addPanel(
             $.containerCPUUsagePanel('CPU', 'ruler'),
           )
-        )
-        .addRow(
-          $.row('')
           .addPanel(
             $.containerMemoryWorkingSetPanel('Memory (workingset)', 'ruler'),
           )

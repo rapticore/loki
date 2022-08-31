@@ -33,7 +33,7 @@ something with that extracted data. The most common action stage will be a
 A common stage will also be the [match](../stages/match/) stage to selectively
 apply stages or drop entries based on a [LogQL stream selector and filter expressions](../../../logql/).
 
-Note that pipelines can not currently be used to deduplicate logs; Loki will
+Note that pipelines can not currently be used to deduplicate logs; Grafana Loki will
 receive the same log line multiple times if, for example:
 
 1. Two scrape configs read from the same file
@@ -221,3 +221,4 @@ Filtering stages:
 
   - [match](../stages/match/): Conditionally run stages based on the label set.
   - [drop](../stages/drop/): Conditionally drop log lines based on several options.
+  - [limit](../stages/limit/): Conditionally rate limit log lines based on several options.

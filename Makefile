@@ -1,31 +1,18 @@
 .DEFAULT_GOAL := all
-.PHONY: all images check-generated-files logcli loki loki-debug promtail promtail-debug loki-canary lint test clean yacc protos touch-protobuf-sources touch-protos
+.PHONY: all images check-generated-files logcli loki loki-debug promtail promtail-debug loki-canary lint test clean yacc protos touch-protobuf-sources format
 .PHONY: docker-driver docker-driver-clean docker-driver-enable docker-driver-push
 .PHONY: fluent-bit-image, fluent-bit-push, fluent-bit-test
 .PHONY: fluentd-image, fluentd-push, fluentd-test
 .PHONY: push-images push-latest save-images load-images promtail-image loki-image build-image
 .PHONY: bigtable-backup, push-bigtable-backup
-.PHONY: benchmark-store, drone, check-mod
-.PHONY: migrate migrate-image lint-markdown
+.PHONY: benchmark-store, drone, check-drone-drift, check-mod
+.PHONY: migrate migrate-image lint-markdown ragel
+.PHONY: validate-example-configs generate-example-config-doc check-example-config-doc
+.PHONY: clean clean-protos
 
-SHELL = /usr/bin/env bash
+SHELL = /usr/bin/env bash -o pipefail
 
-# Empty value = no -mod parameter is used.
-# If not empty, GOMOD is passed to -mod= parameter.
-# In Go 1.13, "readonly" and "vendor" are accepted.
-# In Go 1.14, "readonly", "vendor" and "mod" values are accepted.
-# If no value is specified, defaults to "vendor".
-#
-# Can be used from command line by using "GOMOD= make" (empty = no -mod parameter), or "GOMOD=vendor make" (default).
-
-GOMOD?=vendor
-ifeq ($(strip $(GOMOD)),) # Is empty?
-	MOD_FLAG=
-	GOLANGCI_ARG=
-else
-	MOD_FLAG=-mod=$(GOMOD)
-	GOLANGCI_ARG=--modules-download-mode=$(GOMOD)
-endif
+GOTEST ?= go test
 
 #############
 # Variables #
@@ -38,7 +25,9 @@ DOCKER_IMAGE_DIRS := $(patsubst %/Dockerfile,%,$(DOCKERFILES))
 # make BUILD_IN_CONTAINER=false target
 # or you can override this with an environment variable
 BUILD_IN_CONTAINER ?= true
-BUILD_IMAGE_VERSION := 0.14.0
+
+# ensure you run `make drone` after changing this
+BUILD_IMAGE_VERSION := 0.23.0
 
 # Docker image info
 IMAGE_PREFIX ?= grafana
@@ -53,31 +42,18 @@ GIT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD)
 # 'make: Entering directory '/src/loki' phase.
 DONT_FIND := -name tools -prune -o -name vendor -prune -o -name .git -prune -o -name .cache -prune -o -name .pkg -prune -o
 
-# These are all the application files, they are included in the various binary rules as dependencies
-# to make sure binaries are rebuilt if any source files change.
-APP_GO_FILES := $(shell find . $(DONT_FIND) -name .y.go -prune -o -name .pb.go -prune -o -name cmd -prune -o -type f -name '*.go' -print)
-
 # Build flags
-VPREFIX := github.com/grafana/loki/pkg/build
+VPREFIX := github.com/grafana/loki/pkg/util/build
 GO_LDFLAGS   := -X $(VPREFIX).Branch=$(GIT_BRANCH) -X $(VPREFIX).Version=$(IMAGE_TAG) -X $(VPREFIX).Revision=$(GIT_REVISION) -X $(VPREFIX).BuildUser=$(shell whoami)@$(shell hostname) -X $(VPREFIX).BuildDate=$(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
-GO_FLAGS     := -ldflags "-extldflags \"-static\" -s -w $(GO_LDFLAGS)" -tags netgo $(MOD_FLAG)
-DYN_GO_FLAGS := -ldflags "-s -w $(GO_LDFLAGS)" -tags netgo $(MOD_FLAG)
+GO_FLAGS     := -ldflags "-extldflags \"-static\" -s -w $(GO_LDFLAGS)" -tags netgo
+DYN_GO_FLAGS := -ldflags "-s -w $(GO_LDFLAGS)" -tags netgo
 # Per some websites I've seen to add `-gcflags "all=-N -l"`, the gcflags seem poorly if at all documented
 # the best I could dig up is -N disables optimizations and -l disables inlining which should make debugging match source better.
 # Also remove the -s and -w flags present in the normal build which strip the symbol table and the DWARF symbol table.
-DEBUG_GO_FLAGS     := -gcflags "all=-N -l" -ldflags "-extldflags \"-static\" $(GO_LDFLAGS)" -tags netgo $(MOD_FLAG)
-DYN_DEBUG_GO_FLAGS := -gcflags "all=-N -l" -ldflags "$(GO_LDFLAGS)" -tags netgo $(MOD_FLAG)
+DEBUG_GO_FLAGS     := -gcflags "all=-N -l" -ldflags "-extldflags \"-static\" $(GO_LDFLAGS)" -tags netgo
+DYN_DEBUG_GO_FLAGS := -gcflags "all=-N -l" -ldflags "$(GO_LDFLAGS)" -tags netgo
 # Docker mount flag, ignored on native docker host. see (https://docs.docker.com/docker-for-mac/osxfs-caching/#delegated)
 MOUNT_FLAGS := :delegated
-
-NETGO_CHECK = @strings $@ | grep cgo_stub\\\.go >/dev/null || { \
-       rm $@; \
-       echo "\nYour go standard library was built without the 'netgo' build tag."; \
-       echo "To fix that, run"; \
-       echo "    sudo go clean -i net"; \
-       echo "    sudo go install -tags netgo std"; \
-       false; \
-}
 
 # Protobuf files
 PROTO_DEFS := $(shell find . $(DONT_FIND) -type f -name '*.proto' -print)
@@ -86,6 +62,10 @@ PROTO_GOS := $(patsubst %.proto,%.pb.go,$(PROTO_DEFS))
 # Yacc Files
 YACC_DEFS := $(shell find . $(DONT_FIND) -type f -name *.y -print)
 YACC_GOS := $(patsubst %.y,%.y.go,$(YACC_DEFS))
+
+# Ragel Files
+RAGEL_DEFS := $(shell find . $(DONT_FIND) -type f -name *.rl -print)
+RAGEL_GOS := $(patsubst %.rl,%.rl.go,$(RAGEL_DEFS))
 
 # Promtail UI files
 PROMTAIL_GENERATED_FILE := clients/pkg/promtail/server/ui/assets_vfsdata.go
@@ -123,11 +103,11 @@ binfmt:
 ################
 # Main Targets #
 ################
-all: promtail logcli loki loki-canary check-generated-files
+all: promtail logcli loki loki-canary
 
 # This is really a check for the CI to make sure generated files are built and checked in manually
-check-generated-files: touch-protobuf-sources yacc protos clients/pkg/promtail/server/ui/assets_vfsdata.go
-	@if ! (git diff --exit-code $(YACC_GOS) $(PROTO_GOS) $(PROMTAIL_GENERATED_FILE)); then \
+check-generated-files: yacc ragel fmt-proto protos clients/pkg/promtail/server/ui/assets_vfsdata.go
+	@if ! (git diff --exit-code $(YACC_GOS) $(RAGEL_GOS) $(PROTO_DEFS) $(PROTO_GOS) $(PROMTAIL_GENERATED_FILE)); then \
 		echo "\nChanges found in generated files"; \
 		echo "Run 'make check-generated-files' and commit the changes to fix this error."; \
 		echo "If you are actively developing these files you can ignore this error"; \
@@ -135,59 +115,48 @@ check-generated-files: touch-protobuf-sources yacc protos clients/pkg/promtail/s
 		exit 1; \
 	fi
 
-# Trick used to ensure that protobuf files are always compiled even if not changed, because the
-# tooling may have been upgraded and the compiled output may be different. We're not using a
-# PHONY target so that we can control where we want to touch it.
-touch-protobuf-sources:
-	for def in $(PROTO_DEFS); do \
-		touch $$def; \
-	done
-
 ##########
 # Logcli #
 ##########
-
-logcli: yacc cmd/logcli/logcli
+.PHONY: cmd/logcli/logcli
+logcli: cmd/logcli/logcli
 
 logcli-image:
 	$(SUDO) docker build -t $(IMAGE_PREFIX)/logcli:$(IMAGE_TAG) -f cmd/logcli/Dockerfile .
 
-cmd/logcli/logcli: $(APP_GO_FILES) cmd/logcli/main.go
-	CGO_ENABLED=0 go build $(GO_FLAGS) -o $@ ./$(@D)
-	$(NETGO_CHECK)
+cmd/logcli/logcli:
+	CGO_ENABLED=0 go build $(GO_FLAGS) -o $@ ./cmd/logcli
 
 ########
 # Loki #
 ########
+.PHONY: cmd/loki/loki cmd/loki/loki-debug
+loki: cmd/loki/loki
+loki-debug: cmd/loki/loki-debug
 
-loki: protos yacc cmd/loki/loki
-loki-debug: protos yacc cmd/loki/loki-debug
-
-cmd/loki/loki: $(APP_GO_FILES) cmd/loki/main.go
+cmd/loki/loki:
 	CGO_ENABLED=0 go build $(GO_FLAGS) -o $@ ./$(@D)
-	$(NETGO_CHECK)
 
-cmd/loki/loki-debug: $(APP_GO_FILES) cmd/loki/main.go
+cmd/loki/loki-debug:
 	CGO_ENABLED=0 go build $(DEBUG_GO_FLAGS) -o $@ ./$(@D)
-	$(NETGO_CHECK)
 
 ###############
 # Loki-Canary #
 ###############
+.PHONY: cmd/loki-canary/loki-canary
+loki-canary: cmd/loki-canary/loki-canary
 
-loki-canary: protos yacc cmd/loki-canary/loki-canary
-
-cmd/loki-canary/loki-canary: $(APP_GO_FILES) cmd/loki-canary/main.go
+cmd/loki-canary/loki-canary:
 	CGO_ENABLED=0 go build $(GO_FLAGS) -o $@ ./$(@D)
-	$(NETGO_CHECK)
 
 #################
 # Loki-QueryTee #
 #################
+.PHONY: cmd/querytee/querytee
+loki-querytee: cmd/querytee/querytee
 
-loki-querytee: $(APP_GO_FILES) cmd/querytee/main.go
-	CGO_ENABLED=0 go build $(GO_FLAGS) -o ./cmd/querytee/$@ ./cmd/querytee/
-	$(NETGO_CHECK)
+cmd/querytee/querytee:
+	CGO_ENABLED=0 go build $(GO_FLAGS) -o $@ ./$(@D)
 
 ############
 # Promtail #
@@ -200,14 +169,16 @@ PROMTAIL_DEBUG_GO_FLAGS := $(DEBUG_GO_FLAGS)
 # Validate GOHOSTOS=linux && GOOS=linux to use CGO.
 ifeq ($(shell go env GOHOSTOS),linux)
 ifeq ($(shell go env GOOS),linux)
+ifneq ($(CGO_ENABLED), 0)
 PROMTAIL_CGO = 1
+endif
 PROMTAIL_GO_FLAGS = $(DYN_GO_FLAGS)
 PROMTAIL_DEBUG_GO_FLAGS = $(DYN_DEBUG_GO_FLAGS)
 endif
 endif
-
-promtail: yacc clients/cmd/promtail/promtail
-promtail-debug: yacc clients/cmd/promtail/promtail-debug
+.PHONY: clients/cmd/promtail/promtail clients/cmd/promtail/promtail-debug
+promtail: clients/cmd/promtail/promtail
+promtail-debug: clients/cmd/promtail/promtail-debug
 
 promtail-clean-assets:
 	rm -rf clients/pkg/promtail/server/ui/assets_vfsdata.go
@@ -215,50 +186,79 @@ promtail-clean-assets:
 # Rule to generate promtail static assets file
 $(PROMTAIL_GENERATED_FILE): $(PROMTAIL_UI_FILES)
 	@echo ">> writing assets"
-	GOFLAGS="$(MOD_FLAG)" GOOS=$(shell go env GOHOSTOS) go generate -x -v ./clients/pkg/promtail/server/ui
+	GOOS=$(shell go env GOHOSTOS) go generate -x -v ./clients/pkg/promtail/server/ui
 
-clients/cmd/promtail/promtail: $(APP_GO_FILES) $(PROMTAIL_GENERATED_FILE) clients/cmd/promtail/main.go
+clients/cmd/promtail/promtail:
 	CGO_ENABLED=$(PROMTAIL_CGO) go build $(PROMTAIL_GO_FLAGS) -o $@ ./$(@D)
-	$(NETGO_CHECK)
 
-clients/cmd/promtail/promtail-debug: $(APP_GO_FILES) clients/pkg/promtail/server/ui/assets_vfsdata.go clients/cmd/promtail/main.go
+clients/cmd/promtail/promtail-debug:
 	CGO_ENABLED=$(PROMTAIL_CGO) go build $(PROMTAIL_DEBUG_GO_FLAGS) -o $@ ./$(@D)
-	$(NETGO_CHECK)
+
+#########
+# Mixin #
+#########
+
+MIXIN_PATH := production/loki-mixin
+MIXIN_OUT_PATH := production/loki-mixin-compiled
+MIXIN_OUT_PATH_SSD := production/loki-mixin-compiled-ssd
+
+loki-mixin:
+ifeq ($(BUILD_IN_CONTAINER),true)
+	$(SUDO) docker run $(RM) $(TTY) -i \
+		-v $(shell pwd):/src/loki$(MOUNT_FLAGS) \
+		$(IMAGE_PREFIX)/loki-build-image:$(BUILD_IMAGE_VERSION) $@;
+else
+	@rm -rf $(MIXIN_OUT_PATH) && mkdir $(MIXIN_OUT_PATH)
+	@cd $(MIXIN_PATH) && jb install
+	@mixtool generate all --output-alerts $(MIXIN_OUT_PATH)/alerts.yaml --output-rules $(MIXIN_OUT_PATH)/rules.yaml --directory $(MIXIN_OUT_PATH)/dashboards ${MIXIN_PATH}/mixin.libsonnet
+
+	@rm -rf $(MIXIN_OUT_PATH_SSD) && mkdir $(MIXIN_OUT_PATH_SSD)
+	@cd $(MIXIN_PATH) && jb install
+	@mixtool generate all --output-alerts $(MIXIN_OUT_PATH_SSD)/alerts.yaml --output-rules $(MIXIN_OUT_PATH_SSD)/rules.yaml --directory $(MIXIN_OUT_PATH_SSD)/dashboards ${MIXIN_PATH}/mixin-ssd.libsonnet
+endif
+
+loki-mixin-check: loki-mixin
+	@echo "Checking diff"
+	@git diff --exit-code -- $(MIXIN_OUT_PATH) || (echo "Please build mixin by running 'make loki-mixin'" && false)
+	@git diff --exit-code -- $(MIXIN_OUT_PATH_SSD) || (echo "Please build mixin by running 'make loki-mixin'" && false)
 
 ###############
 # Migrate #
 ###############
-
+.PHONY: cmd/migrate/migrate
 migrate: cmd/migrate/migrate
 
-cmd/migrate/migrate: $(APP_GO_FILES) cmd/migrate/main.go
+cmd/migrate/migrate:
 	CGO_ENABLED=0 go build $(GO_FLAGS) -o $@ ./$(@D)
-	$(NETGO_CHECK)
 
 #############
 # Releasing #
 #############
-# concurrency is limited to 2 to prevent CircleCI from OOMing. Sorry
-GOX = gox $(GO_FLAGS) -parallel=2 -output="dist/{{.Dir}}-{{.OS}}-{{.Arch}}"
-CGO_GOX = gox $(DYN_GO_FLAGS) -cgo -parallel=2 -output="dist/{{.Dir}}-{{.OS}}-{{.Arch}}"
+GOX = gox $(GO_FLAGS) -output="dist/{{.Dir}}-{{.OS}}-{{.Arch}}"
+CGO_GOX = gox $(DYN_GO_FLAGS) -cgo -output="dist/{{.Dir}}-{{.OS}}-{{.Arch}}"
 dist: clean
-	CGO_ENABLED=0 $(GOX) -osarch="linux/amd64 linux/arm64 linux/arm darwin/amd64 windows/amd64 freebsd/amd64" ./cmd/loki
-	CGO_ENABLED=0 $(GOX) -osarch="linux/amd64 linux/arm64 linux/arm darwin/amd64 windows/amd64 freebsd/amd64" ./cmd/logcli
-	CGO_ENABLED=0 $(GOX) -osarch="linux/amd64 linux/arm64 linux/arm darwin/amd64 windows/amd64 freebsd/amd64" ./cmd/loki-canary
-	CGO_ENABLED=0 $(GOX) -osarch="linux/arm64 linux/arm darwin/amd64 windows/amd64 windows/386 freebsd/amd64" ./clients/cmd/promtail
+	CGO_ENABLED=0 $(GOX) -osarch="linux/amd64 linux/arm64 linux/arm darwin/amd64 darwin/arm64 windows/amd64 freebsd/amd64" ./cmd/loki
+	CGO_ENABLED=0 $(GOX) -osarch="linux/amd64 linux/arm64 linux/arm darwin/amd64 darwin/arm64 windows/amd64 freebsd/amd64" ./cmd/logcli
+	CGO_ENABLED=0 $(GOX) -osarch="linux/amd64 linux/arm64 linux/arm darwin/amd64 darwin/arm64 windows/amd64 freebsd/amd64" ./cmd/loki-canary
+	CGO_ENABLED=0 $(GOX) -osarch="linux/arm64 linux/arm darwin/amd64 darwin/arm64 windows/amd64 windows/386 freebsd/amd64" ./clients/cmd/promtail
 	CGO_ENABLED=1 $(CGO_GOX) -osarch="linux/amd64" ./clients/cmd/promtail
 	for i in dist/*; do zip -j -m $$i.zip $$i; done
 	pushd dist && sha256sum * > SHA256SUMS && popd
 
-publish: dist
+packages: dist
+	@tools/packaging/nfpm.sh
+
+publish: packages
 	./tools/release
 
 ########
 # Lint #
 ########
 
+# To run this efficiently on your workstation, run this from the root dir:
+# docker run --rm --tty -i -v $(pwd)/.cache:/go/cache -v $(pwd)/.pkg:/go/pkg -v $(pwd):/src/loki grafana/loki-build-image:0.23.0 lint
 lint:
-	GO111MODULE=on GOGC=10 golangci-lint run -v $(GOLANGCI_ARG)
+	GO111MODULE=on golangci-lint run -v
 	faillint -paths "sync/atomic=go.uber.org/atomic" ./...
 
 ########
@@ -266,11 +266,17 @@ lint:
 ########
 
 test: all
-	GOGC=10 go test -covermode=atomic -coverprofile=coverage.txt $(MOD_FLAG) -p=4 ./...
+	$(GOTEST) -covermode=atomic -coverprofile=coverage.txt -p=4 ./... | tee test_results.txt
+
+compare-coverage:
+	./tools/diff_coverage.sh $(old) $(new) $(packages)
 
 #########
 # Clean #
 #########
+
+clean-protos:
+	rm -rf $(PROTO_GOS)
 
 clean:
 	rm -rf clients/cmd/promtail/promtail
@@ -284,7 +290,8 @@ clean:
 	rm -rf clients/cmd/fluent-bit/out_grafana_loki.h
 	rm -rf clients/cmd/fluent-bit/out_grafana_loki.so
 	rm -rf cmd/migrate/migrate
-	go clean $(MOD_FLAG) ./...
+	rm -rf cmd/logql-analyzer/logql-analyzer
+	go clean ./...
 
 #########
 # YACCs #
@@ -308,17 +315,13 @@ else
 	rm ${@}.back
 endif
 
-#############
-# Protobufs #
-#############
+#########
+# Ragels #
+#########
 
-protos: $(PROTO_GOS)
+ragel: $(RAGEL_GOS)
 
-# use with care. This signals to make that the proto definitions don't need recompiling.
-touch-protos:
-	for proto in $(PROTO_GOS); do [ -f "./$${proto}" ] && touch "$${proto}" && echo "touched $${proto}"; done
-
-%.pb.go: $(PROTO_DEFS)
+%.rl.go: %.rl
 ifeq ($(BUILD_IN_CONTAINER),true)
 	@mkdir -p $(shell pwd)/.pkg
 	@mkdir -p $(shell pwd)/.cache
@@ -328,12 +331,33 @@ ifeq ($(BUILD_IN_CONTAINER),true)
 		-v $(shell pwd):/src/loki$(MOUNT_FLAGS) \
 		$(IMAGE_PREFIX)/loki-build-image:$(BUILD_IMAGE_VERSION) $@;
 else
+	ragel -Z $< -o $@
+endif
+
+#############
+# Protobufs #
+#############
+
+protos: clean-protos $(PROTO_GOS)
+
+%.pb.go:
+ifeq ($(BUILD_IN_CONTAINER),true)
+	@mkdir -p $(shell pwd)/.pkg
+	@mkdir -p $(shell pwd)/.cache
+	$(SUDO) docker run $(RM) $(TTY) -i \
+		-v $(shell pwd)/.cache:/go/cache$(MOUNT_FLAGS) \
+		-v $(shell pwd)/.pkg:/go/pkg$(MOUNT_FLAGS) \
+		-v $(shell pwd):/src/loki$(MOUNT_FLAGS) \
+		$(IMAGE_PREFIX)/loki-build-image:$(BUILD_IMAGE_VERSION) $@;
+else
+	@# The store-gateway RPC is based on Thanos which uses relative references to other protos, so we need
+	@# to configure all such relative paths. `gogo/protobuf` is used by it.
 	case "$@" in	\
 		vendor*)			\
 			protoc -I ./vendor:./$(@D) --gogoslick_out=plugins=grpc:./vendor ./$(patsubst %.pb.go,%.proto,$@); \
 			;;					\
 		*)						\
-			protoc -I .:./vendor:./$(@D) --gogoslick_out=Mgoogle/protobuf/timestamp.proto=github.com/gogo/protobuf/types,plugins=grpc,paths=source_relative:./ ./$(patsubst %.pb.go,%.proto,$@); \
+			protoc -I .:./vendor/github.com/gogo/protobuf:./vendor/github.com/thanos-io/thanos/pkg:./vendor:./$(@D) --gogoslick_out=Mgoogle/protobuf/timestamp.proto=github.com/gogo/protobuf/types,Mgoogle/protobuf/any.proto=github.com/gogo/protobuf/types,plugins=grpc,paths=source_relative:./ ./$(patsubst %.pb.go,%.proto,$@); \
 			;;					\
 		esac
 endif
@@ -348,23 +372,33 @@ LOKI_DOCKER_DRIVER ?= "grafana/loki-docker-driver"
 PLUGIN_TAG ?= $(IMAGE_TAG)
 PLUGIN_ARCH ?=
 
-docker-driver: docker-driver-clean
+# build-rootfs
+# builds the plugin rootfs
+define build-rootfs
+	rm -rf clients/cmd/docker-driver/rootfs || true
 	mkdir clients/cmd/docker-driver/rootfs
 	docker build -t rootfsimage -f clients/cmd/docker-driver/Dockerfile .
+
 	ID=$$(docker create rootfsimage true) && \
 	(docker export $$ID | tar -x -C clients/cmd/docker-driver/rootfs) && \
 	docker rm -vf $$ID
-	docker rmi rootfsimage -f
-	docker plugin create $(LOKI_DOCKER_DRIVER):$(PLUGIN_TAG)$(PLUGIN_ARCH) clients/cmd/docker-driver
-	docker plugin create $(LOKI_DOCKER_DRIVER):latest$(PLUGIN_ARCH) clients/cmd/docker-driver
 
-clients/cmd/docker-driver/docker-driver: $(APP_GO_FILES)
+	docker rmi rootfsimage -f
+endef
+
+docker-driver: docker-driver-clean
+	$(build-rootfs)
+	docker plugin create $(LOKI_DOCKER_DRIVER):$(PLUGIN_TAG)$(PLUGIN_ARCH) clients/cmd/docker-driver
+
+	$(build-rootfs)
+	docker plugin create $(LOKI_DOCKER_DRIVER):main$(PLUGIN_ARCH) clients/cmd/docker-driver
+
+clients/cmd/docker-driver/docker-driver:
 	CGO_ENABLED=0 go build $(GO_FLAGS) -o $@ ./$(@D)
-	$(NETGO_CHECK)
 
 docker-driver-push: docker-driver
 	docker plugin push $(LOKI_DOCKER_DRIVER):$(PLUGIN_TAG)$(PLUGIN_ARCH)
-	docker plugin push $(LOKI_DOCKER_DRIVER):latest$(PLUGIN_ARCH)
+	docker plugin push $(LOKI_DOCKER_DRIVER):main$(PLUGIN_ARCH)
 
 docker-driver-enable:
 	docker plugin enable $(LOKI_DOCKER_DRIVER):$(PLUGIN_TAG)$(PLUGIN_ARCH)
@@ -372,7 +406,7 @@ docker-driver-enable:
 docker-driver-clean:
 	-docker plugin disable $(LOKI_DOCKER_DRIVER):$(PLUGIN_TAG)$(PLUGIN_ARCH)
 	-docker plugin rm $(LOKI_DOCKER_DRIVER):$(PLUGIN_TAG)$(PLUGIN_ARCH)
-	-docker plugin rm $(LOKI_DOCKER_DRIVER):latest$(PLUGIN_ARCH)
+	-docker plugin rm $(LOKI_DOCKER_DRIVER):main$(PLUGIN_ARCH)
 	rm -rf clients/cmd/docker-driver/rootfs
 
 #####################
@@ -397,9 +431,10 @@ fluent-bit-test:
 # fluentd plugin #
 ##################
 fluentd-plugin:
-	gem install bundler --version 1.16.2
+	gem install bundler --version 2.3.4
 	bundle config silence_root_warning true
-	bundle install --gemfile=clients/cmd/fluentd/Gemfile --path=clients/cmd/fluentd/vendor/bundle
+	bundle config set --local path clients/cmd/fluentd/vendor/bundle
+	bundle install --gemfile=clients/cmd/fluentd/Gemfile
 
 fluentd-image:
 	$(SUDO) docker build -t $(IMAGE_PREFIX)/fluent-plugin-loki:$(IMAGE_TAG) -f clients/cmd/fluentd/Dockerfile .
@@ -407,9 +442,9 @@ fluentd-image:
 fluentd-push:
 	$(SUDO) $(PUSH_OCI) $(IMAGE_PREFIX)/fluent-plugin-loki:$(IMAGE_TAG)
 
-fluentd-test: LOKI_URL ?= http://localhost:3100/loki/api/
+fluentd-test: LOKI_URL ?= http://loki:3100
 fluentd-test:
-	LOKI_URL="$(LOKI_URL)" docker-compose -f clients/cmd/fluentd/docker/docker-compose.yml up --build $(IMAGE_PREFIX)/fluent-plugin-loki:$(IMAGE_TAG)
+	LOKI_URL="$(LOKI_URL)" docker-compose -f clients/cmd/fluentd/docker/docker-compose.yml up --build
 
 ##################
 # logstash plugin #
@@ -458,11 +493,10 @@ define push
 endef
 
 # push-image(app)
-# pushes the app, also as :latest and :master
+# pushes the app, also as :main
 define push-image
 	$(call push,$(1),$(IMAGE_TAG))
-	$(call push,$(1),master)
-	$(call push,$(1),latest)
+	$(call push,$(1),main)
 endef
 
 # promtail
@@ -501,15 +535,21 @@ loki-canary-push: loki-canary-image-cross
 
 # loki-querytee
 loki-querytee-image:
-	$(SUDO) docker build -t $(IMAGE_PREFIX)/loki-querytee:$(IMAGE_TAG) -f cmd/querytee/Dockerfile .
+	$(SUDO) docker build -t $(IMAGE_PREFIX)/loki-query-tee:$(IMAGE_TAG) -f cmd/querytee/Dockerfile .
 loki-querytee-image-cross:
-	$(SUDO) $(BUILD_OCI) -t $(IMAGE_PREFIX)/loki-querytee:$(IMAGE_TAG) -f cmd/querytee/Dockerfile.cross .
+	$(SUDO) $(BUILD_OCI) -t $(IMAGE_PREFIX)/loki-query-tee:$(IMAGE_TAG) -f cmd/querytee/Dockerfile.cross .
 loki-querytee-push: loki-querytee-image-cross
-	$(SUDO) $(PUSH_OCI) $(IMAGE_PREFIX)/loki-querytee:$(IMAGE_TAG)
+	$(SUDO) $(PUSH_OCI) $(IMAGE_PREFIX)/loki-query-tee:$(IMAGE_TAG)
 
 # migrate-image
 migrate-image:
 	$(SUDO) docker build -t $(IMAGE_PREFIX)/loki-migrate:$(IMAGE_TAG) -f cmd/migrate/Dockerfile .
+
+# LogQL Analyzer
+logql-analyzer-image:
+	$(SUDO) docker build -t $(IMAGE_PREFIX)/logql-analyzer:$(IMAGE_TAG) -f cmd/logql-analyzer/Dockerfile .
+logql-analyzer-push: logql-analyzer-image
+	$(call push-image,logql-analyzer)
 
 
 # build-image (only amd64)
@@ -524,14 +564,21 @@ endif
 	$(call push,loki-build-image,$(BUILD_IMAGE_VERSION))
 	$(call push,loki-build-image,latest)
 
+# loki-operator
+loki-operator-image:
+	$(SUDO) docker build -t $(IMAGE_PREFIX)/loki-operator:$(IMAGE_TAG) -f operator/Dockerfile operator/
+loki-operator-image-cross:
+	$(SUDO) $(BUILD_OCI) -t $(IMAGE_PREFIX)/loki-operator:$(IMAGE_TAG) -f operator/Dockerfile.cross operator/
+loki-operator-push: loki-operator-image-cross
+	$(SUDO) $(PUSH_OCI) $(IMAGE_PREFIX)/loki-operator:$(IMAGE_TAG)
 
 ########
 # Misc #
 ########
 
 benchmark-store:
-	go run $(MOD_FLAG) ./pkg/storage/hack/main.go
-	go test $(MOD_FLAG) ./pkg/storage/ -bench=.  -benchmem -memprofile memprofile.out -cpuprofile cpuprofile.out -trace trace.out
+	go run ./pkg/storage/hack/main.go
+	$(GOTEST) ./pkg/storage/ -bench=.  -benchmem -memprofile memprofile.out -cpuprofile cpuprofile.out -trace trace.out
 
 # regenerate drone yaml
 drone:
@@ -539,13 +586,19 @@ ifeq ($(BUILD_IN_CONTAINER),true)
 	@mkdir -p $(shell pwd)/.pkg
 	@mkdir -p $(shell pwd)/.cache
 	$(SUDO) docker run $(RM) $(TTY) -i \
+		-e DRONE_SERVER -e DRONE_TOKEN \
 		-v $(shell pwd)/.cache:/go/cache$(MOUNT_FLAGS) \
 		-v $(shell pwd)/.pkg:/go/pkg$(MOUNT_FLAGS) \
 		-v $(shell pwd):/src/loki$(MOUNT_FLAGS) \
 		$(IMAGE_PREFIX)/loki-build-image:$(BUILD_IMAGE_VERSION) $@;
 else
 	drone jsonnet --stream --format -V __build-image-version=$(BUILD_IMAGE_VERSION) --source .drone/drone.jsonnet --target .drone/drone.yml
+	drone lint .drone/drone.yml --trusted
+	drone sign --save grafana/loki .drone/drone.yml || echo "You must set DRONE_SERVER and DRONE_TOKEN. These values can be found on your [drone account](http://drone.grafana.net/account) page."
 endif
+
+check-drone-drift:
+	./tools/check-drone-drift.sh $(BUILD_IMAGE_VERSION)
 
 
 # support go modules
@@ -570,11 +623,46 @@ lint-jsonnet:
 		jsonnetfmt -- "$$f" | diff -u "$$f" -; \
 		RESULT=$$(($$RESULT + $$?)); \
 	done; \
+	for d in $$(find . -name '*-mixin' -a -type d -print); do \
+		if [ -e "$$d/jsonnetfile.json" ]; then \
+			echo "Installing dependencies for $$d"; \
+			pushd "$$d" >/dev/null && jb install && popd >/dev/null; \
+		fi; \
+	done; \
+	for m in $$(find . -name 'mixin.libsonnet' -not -path '*/vendor/*' -print); do \
+			echo "Linting $$m"; \
+			mixtool lint -J $$(dirname "$$m")/vendor "$$m"; \
+			if [ $$? -ne 0 ]; then \
+				RESULT=1; \
+			fi; \
+	done; \
 	exit $$RESULT
 
 fmt-jsonnet:
 	@find . -name 'vendor' -prune -o -name '*.libsonnet' -print -o -name '*.jsonnet' -print | \
 		xargs -n 1 -- jsonnetfmt -i
+
+fmt-proto:
+ifeq ($(BUILD_IN_CONTAINER),true)
+	# I wish we could make this a multiline variable however you can't pass more than simple arguments to them
+	@mkdir -p $(shell pwd)/.pkg
+	@mkdir -p $(shell pwd)/.cache
+	$(SUDO) docker run $(RM) $(TTY) -i \
+		-v $(shell pwd)/.cache:/go/cache$(MOUNT_FLAGS) \
+		-v $(shell pwd)/.pkg:/go/pkg$(MOUNT_FLAGS) \
+		-v $(shell pwd):/src/loki$(MOUNT_FLAGS) \
+		$(IMAGE_PREFIX)/loki-build-image:$(BUILD_IMAGE_VERSION) $@;
+else
+	echo '$(PROTO_DEFS)' | \
+		xargs -n 1 -- buf format -w
+endif
+
+
+lint-scripts:
+    # Ignore https://github.com/koalaman/shellcheck/wiki/SC2312
+	@find . -name '*.sh' -not -path '*/vendor/*' -print0 | \
+		xargs -0 -n1 shellcheck -e SC2312 -x -o all
+
 
 # search for dead link in our documentation.
 # To avoid being rate limited by Github you can use an env variable GITHUB_TOKEN to pass a github token API.
@@ -592,5 +680,38 @@ endif
 # usage: FUZZ_TESTCASE_PATH=/tmp/testcase make test-fuzz
 # this will run the fuzzing using /tmp/testcase and save benchmark locally.
 test-fuzz:
-	go test -timeout 30s -tags dev,gofuzz -cpuprofile cpu.prof -memprofile mem.prof  \
-		-run ^Test_Fuzz$$ github.com/grafana/loki/pkg/logql -v -count=1 -timeout=0s
+	$(GOTEST) -timeout 30s -tags dev,gofuzz -cpuprofile cpu.prof -memprofile mem.prof  \
+	  -run ^Test_Fuzz$$ github.com/grafana/loki/pkg/logql/syntax -v -count=1 -timeout=0s
+
+format:
+	find . $(DONT_FIND) -name '*.pb.go' -prune -o -name '*.y.go' -prune -o -name '*.rl.go' -prune -o \
+		-type f -name '*.go' -exec gofmt -w -s {} \;
+	find . $(DONT_FIND) -name '*.pb.go' -prune -o -name '*.y.go' -prune -o -name '*.rl.go' -prune -o \
+		-type f -name '*.go' -exec goimports -w -local github.com/grafana/loki {} \;
+
+###################
+# Example Configs #
+###################
+
+# Validate the example configurations that we provide in ./docs/sources/configuration/examples
+validate-example-configs: loki
+	for f in ./docs/sources/configuration/examples/*.yaml; do echo "Validating provided example config: $$f" && ./cmd/loki/loki -config.file=$$f -verify-config || exit 1; done
+
+# Dynamically generate ./docs/sources/configuration/examples.md using the example configs that we provide.
+# This target should be run if any of our example configs change.
+generate-example-config-doc:
+	echo "Removing existing doc at loki/docs/configuration/examples.md and re-generating. . ."
+	# Title and Heading
+	echo -e "---\ntitle: Examples\n---\n # Loki Configuration Examples" > ./docs/sources/configuration/examples.md
+	# Append each configuration and its file name to examples.md
+	for f in ./docs/sources/configuration/examples/*.yaml; do echo -e "\n## $$(basename $$f)\n\n\`\`\`yaml\n$$(cat $$f)\n\`\`\`\n" >> ./docs/sources/configuration/examples.md; done
+
+# Fail our CI build if changes are made to example configurations but our doc is not updated
+check-example-config-doc: generate-example-config-doc
+	@if ! (git diff --exit-code ./docs/sources/configuration/examples.md); then \
+		echo -e "\nChanges found in generated example configuration doc"; \
+		echo "Run 'make generate-example-config-doc' and commit the changes to fix this error."; \
+		echo "If you are actively developing these files you can ignore this error"; \
+		echo -e "(Don't forget to check in the generated files when finished)\n"; \
+		exit 1; \
+	fi

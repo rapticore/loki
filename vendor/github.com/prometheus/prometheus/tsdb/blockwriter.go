@@ -15,16 +15,15 @@ package tsdb
 
 import (
 	"context"
-	"io/ioutil"
 	"math"
 	"os"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 
-	"github.com/prometheus/prometheus/pkg/timestamp"
+	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 )
@@ -64,7 +63,7 @@ func NewBlockWriter(logger log.Logger, dir string, blockSize int64) (*BlockWrite
 
 // initHead creates and initialises a new TSDB head.
 func (w *BlockWriter) initHead() error {
-	chunkDir, err := ioutil.TempDir(os.TempDir(), "head")
+	chunkDir, err := os.MkdirTemp(os.TempDir(), "head")
 	if err != nil {
 		return errors.Wrap(err, "create temp dir")
 	}
@@ -72,7 +71,7 @@ func (w *BlockWriter) initHead() error {
 	opts := DefaultHeadOptions()
 	opts.ChunkRange = w.blockSize
 	opts.ChunkDirRoot = w.chunkDir
-	h, err := NewHead(nil, w.logger, nil, opts)
+	h, err := NewHead(nil, w.logger, nil, opts, NewHeadStats())
 	if err != nil {
 		return errors.Wrap(err, "tsdb.NewHead")
 	}
@@ -100,7 +99,7 @@ func (w *BlockWriter) Flush(ctx context.Context) (ulid.ULID, error) {
 		nil,
 		w.logger,
 		[]int64{w.blockSize},
-		chunkenc.NewPool())
+		chunkenc.NewPool(), nil)
 	if err != nil {
 		return ulid.ULID{}, errors.Wrap(err, "create leveled compactor")
 	}

@@ -3,7 +3,7 @@ package distributor
 import (
 	"testing"
 
-	"github.com/cortexproject/cortex/pkg/util/limiter"
+	"github.com/grafana/dskit/limiter"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -44,6 +44,20 @@ func TestIngestionRateStrategy(t *testing.T) {
 				return ring
 			}(),
 			expectedLimit: 0.5 * float64(bytesInMB),
+			expectedBurst: int(2.0 * float64(bytesInMB)),
+		},
+		"global rate limiter should share nothing when there aren't any distributors": {
+			limits: validation.Limits{
+				IngestionRateStrategy: validation.GlobalIngestionRateStrategy,
+				IngestionRateMB:       1.0,
+				IngestionBurstSizeMB:  2.0,
+			},
+			ring: func() ReadLifecycler {
+				ring := newReadLifecyclerMock()
+				ring.On("HealthyInstancesCount").Return(0)
+				return ring
+			}(),
+			expectedLimit: 1.0 * float64(bytesInMB),
 			expectedBurst: int(2.0 * float64(bytesInMB)),
 		},
 	}

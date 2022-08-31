@@ -22,12 +22,13 @@ import (
 )
 
 const (
-	queryPath       = "/loki/api/v1/query"
-	queryRangePath  = "/loki/api/v1/query_range"
-	labelsPath      = "/loki/api/v1/labels"
-	labelValuesPath = "/loki/api/v1/label/%s/values"
-	seriesPath      = "/loki/api/v1/series"
-	tailPath        = "/loki/api/v1/tail"
+	queryPath         = "/loki/api/v1/query"
+	queryRangePath    = "/loki/api/v1/query_range"
+	labelsPath        = "/loki/api/v1/labels"
+	labelValuesPath   = "/loki/api/v1/label/%s/values"
+	seriesPath        = "/loki/api/v1/series"
+	tailPath          = "/loki/api/v1/tail"
+	defaultAuthHeader = "Authorization"
 )
 
 var userAgent = fmt.Sprintf("loki-logcli/%s", build.Version)
@@ -48,12 +49,18 @@ type Tripperware func(http.RoundTripper) http.RoundTripper
 
 // Client contains fields necessary to query a Loki instance
 type DefaultClient struct {
-	TLSConfig   config.TLSConfig
-	Username    string
-	Password    string
-	Address     string
-	OrgID       string
-	Tripperware Tripperware
+	TLSConfig       config.TLSConfig
+	Username        string
+	Password        string
+	Address         string
+	OrgID           string
+	Tripperware     Tripperware
+	BearerToken     string
+	BearerTokenFile string
+	Retries         int
+	QueryTags       string
+	AuthHeader      string
+	ProxyURL        string
 }
 
 // Query uses the /api/v1/query endpoint to execute an instant query
@@ -174,16 +181,23 @@ func (c *DefaultClient) doRequest(path, query string, quiet bool, out interface{
 		return err
 	}
 
-	req.SetBasicAuth(c.Username, c.Password)
-	req.Header.Set("User-Agent", userAgent)
-
-	if c.OrgID != "" {
-		req.Header.Set("X-Scope-OrgID", c.OrgID)
+	h, err := c.getHTTPRequestHeader()
+	if err != nil {
+		return err
 	}
+	req.Header = h
 
 	// Parse the URL to extract the host
 	clientConfig := config.HTTPClientConfig{
 		TLSConfig: c.TLSConfig,
+	}
+
+	if c.ProxyURL != "" {
+		prox, err := url.Parse(c.ProxyURL)
+		if err != nil {
+			return err
+		}
+		clientConfig.ProxyURL = config.URL{URL: prox}
 	}
 
 	client, err := config.NewClientFromConfig(clientConfig, "promtail", config.WithHTTP2Disabled())
@@ -193,22 +207,93 @@ func (c *DefaultClient) doRequest(path, query string, quiet bool, out interface{
 	if c.Tripperware != nil {
 		client.Transport = c.Tripperware(client.Transport)
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
+
+	var resp *http.Response
+	attempts := c.Retries + 1
+	success := false
+
+	for attempts > 0 {
+		attempts--
+
+		resp, err = client.Do(req)
+		if err != nil {
+			log.Println("error sending request", err)
+			continue
+		}
+		if resp.StatusCode/100 != 2 {
+			buf, _ := ioutil.ReadAll(resp.Body) // nolint
+			log.Printf("Error response from server: %s (%v) attempts remaining: %d", string(buf), err, attempts)
+			if err := resp.Body.Close(); err != nil {
+				log.Println("error closing body", err)
+			}
+			continue
+		}
+		success = true
+		break
 	}
+	if !success {
+		return fmt.Errorf("Run out of attempts while querying the server")
+	}
+
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
 			log.Println("error closing body", err)
 		}
 	}()
+	return json.NewDecoder(resp.Body).Decode(out)
+}
 
-	if resp.StatusCode/100 != 2 {
-		buf, _ := ioutil.ReadAll(resp.Body) // nolint
-		return fmt.Errorf("Error response from server: %s (%v)", string(buf), err)
+func (c *DefaultClient) getHTTPRequestHeader() (http.Header, error) {
+	h := make(http.Header)
+
+	if c.Username != "" && c.Password != "" {
+		if c.AuthHeader == "" {
+			c.AuthHeader = defaultAuthHeader
+		}
+		h.Set(
+			c.AuthHeader,
+			"Basic "+base64.StdEncoding.EncodeToString([]byte(c.Username+":"+c.Password)),
+		)
 	}
 
-	return json.NewDecoder(resp.Body).Decode(out)
+	h.Set("User-Agent", userAgent)
+
+	if c.OrgID != "" {
+		h.Set("X-Scope-OrgID", c.OrgID)
+	}
+
+	if c.QueryTags != "" {
+		h.Set("X-Query-Tags", c.QueryTags)
+	}
+
+	if (c.Username != "" || c.Password != "") && (len(c.BearerToken) > 0 || len(c.BearerTokenFile) > 0) {
+		return nil, fmt.Errorf("at most one of HTTP basic auth (username/password), bearer-token & bearer-token-file is allowed to be configured")
+	}
+
+	if len(c.BearerToken) > 0 && len(c.BearerTokenFile) > 0 {
+		return nil, fmt.Errorf("at most one of the options bearer-token & bearer-token-file is allowed to be configured")
+	}
+
+	if c.BearerToken != "" {
+		if c.AuthHeader == "" {
+			c.AuthHeader = defaultAuthHeader
+		}
+
+		h.Set(c.AuthHeader, "Bearer "+c.BearerToken)
+	}
+
+	if c.BearerTokenFile != "" {
+		b, err := ioutil.ReadFile(c.BearerTokenFile)
+		if err != nil {
+			return nil, fmt.Errorf("unable to read authorization credentials file %s: %s", c.BearerTokenFile, err)
+		}
+		bearerToken := strings.TrimSpace(string(b))
+		if c.AuthHeader == "" {
+			c.AuthHeader = defaultAuthHeader
+		}
+		h.Set(c.AuthHeader, "Bearer "+bearerToken)
+	}
+	return h, nil
 }
 
 func (c *DefaultClient) wsConnect(path, query string, quiet bool) (*websocket.Conn, error) {
@@ -222,23 +307,27 @@ func (c *DefaultClient) wsConnect(path, query string, quiet bool) (*websocket.Co
 		return nil, err
 	}
 
-	if strings.HasPrefix(us, "https") {
-		us = strings.Replace(us, "https", "wss", 1)
-	} else if strings.HasPrefix(us, "http") {
+	if strings.HasPrefix(us, "http") {
 		us = strings.Replace(us, "http", "ws", 1)
 	}
+
 	if !quiet {
 		log.Println(us)
 	}
 
-	h := http.Header{"Authorization": {"Basic " + base64.StdEncoding.EncodeToString([]byte(c.Username+":"+c.Password))}}
-
-	if c.OrgID != "" {
-		h.Set("X-Scope-OrgID", c.OrgID)
+	h, err := c.getHTTPRequestHeader()
+	if err != nil {
+		return nil, err
 	}
 
 	ws := websocket.Dialer{
 		TLSClientConfig: tlsConfig,
+	}
+
+	if c.ProxyURL != "" {
+		ws.Proxy = func(req *http.Request) (*url.URL, error) {
+			return url.Parse(c.ProxyURL)
+		}
 	}
 
 	conn, resp, err := ws.Dial(us, h)

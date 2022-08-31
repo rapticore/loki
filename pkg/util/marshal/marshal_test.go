@@ -7,7 +7,7 @@ import (
 	"time"
 
 	json "github.com/json-iterator/go"
-	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/stretchr/testify/require"
@@ -51,33 +51,73 @@ var queryTests = []struct {
 				],
 				"stats" : {
 					"ingester" : {
-						"compressedBytes": 0,
-						"decompressedBytes": 0,
-						"decompressedLines": 0,
-						"headChunkBytes": 0,
-						"headChunkLines": 0,
+						"store": {
+							"chunksDownloadTime": 0,
+							"totalChunksRef": 0,
+							"totalChunksDownloaded": 0,
+							"chunk" :{
+								"compressedBytes": 0,
+								"decompressedBytes": 0,
+								"decompressedLines": 0,
+								"headChunkBytes": 0,
+								"headChunkLines": 0,
+								"totalDuplicates": 0
+							}
+						},
 						"totalBatches": 0,
 						"totalChunksMatched": 0,
-						"totalDuplicates": 0,
 						"totalLinesSent": 0,
 						"totalReached": 0
 					},
-					"store": {
-						"compressedBytes": 0,
-						"decompressedBytes": 0,
-						"decompressedLines": 0,
-						"headChunkBytes": 0,
-						"headChunkLines": 0,
-						"chunksDownloadTime": 0,
-						"totalChunksRef": 0,
-						"totalChunksDownloaded": 0,
-						"totalDuplicates": 0
+					"querier": {
+						"store": {
+							"chunksDownloadTime": 0,
+							"totalChunksRef": 0,
+							"totalChunksDownloaded": 0,
+							"chunk" :{
+								"compressedBytes": 0,
+								"decompressedBytes": 0,
+								"decompressedLines": 0,
+								"headChunkBytes": 0,
+								"headChunkLines": 0,
+								"totalDuplicates": 0
+							}
+						}
+					},
+					"cache": {
+						"chunk": {
+							"entriesFound": 0,
+							"entriesRequested": 0,
+							"entriesStored": 0,
+							"bytesReceived": 0,
+							"bytesSent": 0,
+							"requests": 0
+						},
+						"index": {
+							"entriesFound": 0,
+							"entriesRequested": 0,
+							"entriesStored": 0,
+							"bytesReceived": 0,
+							"bytesSent": 0,
+							"requests": 0
+						},
+						"result": {
+							"entriesFound": 0,
+							"entriesRequested": 0,
+							"entriesStored": 0,
+							"bytesReceived": 0,
+							"bytesSent": 0,
+							"requests": 0
+						}
 					},
 					"summary": {
 						"bytesProcessedPerSecond": 0,
 						"execTime": 0,
 						"linesProcessedPerSecond": 0,
+						"queueTime": 0,
+						"subqueries": 0,
 						"totalBytesProcessed":0,
+                                                "totalEntriesReturned":0,
 						"totalLinesProcessed":0
 					}
 				}
@@ -147,33 +187,73 @@ var queryTests = []struct {
 			  ],
 			  "stats" : {
 				"ingester" : {
-					"compressedBytes": 0,
-					"decompressedBytes": 0,
-					"decompressedLines": 0,
-					"headChunkBytes": 0,
-					"headChunkLines": 0,
+					"store": {
+						"chunksDownloadTime": 0,
+						"totalChunksRef": 0,
+						"totalChunksDownloaded": 0,
+						"chunk" :{
+							"compressedBytes": 0,
+							"decompressedBytes": 0,
+							"decompressedLines": 0,
+							"headChunkBytes": 0,
+							"headChunkLines": 0,
+							"totalDuplicates": 0
+						}
+					},
 					"totalBatches": 0,
 					"totalChunksMatched": 0,
-					"totalDuplicates": 0,
 					"totalLinesSent": 0,
 					"totalReached": 0
 				},
-				"store": {
-					"compressedBytes": 0,
-					"decompressedBytes": 0,
-					"decompressedLines": 0,
-					"headChunkBytes": 0,
-					"headChunkLines": 0,
-					"chunksDownloadTime": 0,
-					"totalChunksRef": 0,
-					"totalChunksDownloaded": 0,
-					"totalDuplicates": 0
+				"querier": {
+					"store": {
+						"chunksDownloadTime": 0,
+						"totalChunksRef": 0,
+						"totalChunksDownloaded": 0,
+						"chunk" :{
+							"compressedBytes": 0,
+							"decompressedBytes": 0,
+							"decompressedLines": 0,
+							"headChunkBytes": 0,
+							"headChunkLines": 0,
+							"totalDuplicates": 0
+						}
+					}
+				},
+				"cache": {
+					"chunk": {
+						"entriesFound": 0,
+						"entriesRequested": 0,
+						"entriesStored": 0,
+						"bytesReceived": 0,
+						"bytesSent": 0,
+						"requests": 0
+					},
+					"index": {
+						"entriesFound": 0,
+						"entriesRequested": 0,
+						"entriesStored": 0,
+						"bytesReceived": 0,
+						"bytesSent": 0,
+						"requests": 0
+					},
+					"result": {
+						"entriesFound": 0,
+						"entriesRequested": 0,
+						"entriesStored": 0,
+						"bytesReceived": 0,
+						"bytesSent": 0,
+						"requests": 0
+					}
 				},
 				"summary": {
 					"bytesProcessedPerSecond": 0,
 					"execTime": 0,
 					"linesProcessedPerSecond": 0,
+					"queueTime": 0,
+					"subqueries": 0,
 					"totalBytesProcessed":0,
+                                        "totalEntriesReturned":0,
 					"totalLinesProcessed":0
 				}
 			  }
@@ -260,33 +340,73 @@ var queryTests = []struct {
 			  ],
 			  "stats" : {
 				"ingester" : {
-					"compressedBytes": 0,
-					"decompressedBytes": 0,
-					"decompressedLines": 0,
-					"headChunkBytes": 0,
-					"headChunkLines": 0,
+					"store": {
+						"chunksDownloadTime": 0,
+						"totalChunksRef": 0,
+						"totalChunksDownloaded": 0,
+						"chunk" :{
+							"compressedBytes": 0,
+							"decompressedBytes": 0,
+							"decompressedLines": 0,
+							"headChunkBytes": 0,
+							"headChunkLines": 0,
+							"totalDuplicates": 0
+						}
+					},
 					"totalBatches": 0,
 					"totalChunksMatched": 0,
-					"totalDuplicates": 0,
 					"totalLinesSent": 0,
 					"totalReached": 0
 				},
-				"store": {
-					"compressedBytes": 0,
-					"decompressedBytes": 0,
-					"decompressedLines": 0,
-					"headChunkBytes": 0,
-					"headChunkLines": 0,
-					"chunksDownloadTime": 0,
-					"totalChunksRef": 0,
-					"totalChunksDownloaded": 0,
-					"totalDuplicates": 0
+				"querier": {
+					"store": {
+						"chunksDownloadTime": 0,
+						"totalChunksRef": 0,
+						"totalChunksDownloaded": 0,
+						"chunk" :{
+							"compressedBytes": 0,
+							"decompressedBytes": 0,
+							"decompressedLines": 0,
+							"headChunkBytes": 0,
+							"headChunkLines": 0,
+							"totalDuplicates": 0
+						}
+					}
+				},
+				"cache": {
+					"chunk": {
+						"entriesFound": 0,
+						"entriesRequested": 0,
+						"entriesStored": 0,
+						"bytesReceived": 0,
+						"bytesSent": 0,
+						"requests": 0
+					},
+					"index": {
+						"entriesFound": 0,
+						"entriesRequested": 0,
+						"entriesStored": 0,
+						"bytesReceived": 0,
+						"bytesSent": 0,
+						"requests": 0
+					},
+					"result": {
+						"entriesFound": 0,
+						"entriesRequested": 0,
+						"entriesStored": 0,
+						"bytesReceived": 0,
+						"bytesSent": 0,
+						"requests": 0
+					}
 				},
 				"summary": {
 					"bytesProcessedPerSecond": 0,
 					"execTime": 0,
 					"linesProcessedPerSecond": 0,
+					"queueTime": 0,
+					"subqueries": 0,
 					"totalBytesProcessed":0,
+                                        "totalEntriesReturned":0,
 					"totalLinesProcessed":0
 				}
 			  }

@@ -15,19 +15,20 @@ package kubernetes
 
 import (
 	"context"
-	"github.com/prometheus/prometheus/util/strutil"
+	"errors"
+	"fmt"
 	"net"
 	"strconv"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
-	"github.com/pkg/errors"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/prometheus/common/model"
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
 	"github.com/prometheus/prometheus/discovery/targetgroup"
+	"github.com/prometheus/prometheus/util/strutil"
 )
 
 var (
@@ -135,7 +136,7 @@ func (e *Endpoints) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 	defer e.queue.ShutDown()
 
 	if !cache.WaitForCacheSync(ctx.Done(), e.endpointsInf.HasSynced, e.serviceInf.HasSynced, e.podInf.HasSynced) {
-		if ctx.Err() != context.Canceled {
+		if !errors.Is(ctx.Err(), context.Canceled) {
 			level.Error(e.logger).Log("msg", "endpoints informer unable to sync cache")
 		}
 		return
@@ -188,7 +189,7 @@ func convertToEndpoints(o interface{}) (*apiv1.Endpoints, error) {
 		return endpoints, nil
 	}
 
-	return nil, errors.Errorf("received unexpected object: %v", o)
+	return nil, fmt.Errorf("received unexpected object: %v", o)
 }
 
 func endpointsSource(ep *apiv1.Endpoints) string {
@@ -221,7 +222,7 @@ func (e *Endpoints) buildEndpoints(eps *apiv1.Endpoints) *targetgroup.Group {
 		endpointsNameLabel: lv(eps.Name),
 	}
 	e.addServiceLabels(eps.Namespace, eps.Name, tg)
-	//add endponits labels metadata
+	// Add endpoints labels metadata.
 	for k, v := range eps.Labels {
 		ln := strutil.SanitizeLabelName(k)
 		tg.Labels[model.LabelName(endpointsLabelPrefix+ln)] = lv(v)
@@ -305,6 +306,14 @@ func (e *Endpoints) buildEndpoints(eps *apiv1.Endpoints) *targetgroup.Group {
 				add(addr, port, "false")
 			}
 		}
+	}
+
+	v := eps.Labels[apiv1.EndpointsOverCapacity]
+	if v == "truncated" {
+		level.Warn(e.logger).Log("msg", "Number of endpoints in one Endpoints object exceeds 1000 and has been truncated, please use \"role: endpointslice\" instead", "endpoint", eps.Name)
+	}
+	if v == "warning" {
+		level.Warn(e.logger).Log("msg", "Number of endpoints in one Endpoints object exceeds 1000, please use \"role: endpointslice\" instead", "endpoint", eps.Name)
 	}
 
 	// For all seen pods, check all container ports. If they were not covered

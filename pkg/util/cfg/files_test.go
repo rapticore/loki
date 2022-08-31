@@ -4,7 +4,7 @@ import (
 	"flag"
 	"testing"
 
-	"github.com/cortexproject/cortex/pkg/util/flagext"
+	"github.com/grafana/dskit/flagext"
 	"github.com/stretchr/testify/require"
 )
 
@@ -22,9 +22,9 @@ func (cfg *testCfg) Clone() flagext.Registerer {
 	}(*cfg)
 }
 
-func TestYAMLFlagDoesNotMutate(t *testing.T) {
+func TestConfigFileLoaderDoesNotMutate(t *testing.T) {
 	cfg := &testCfg{}
-	err := YAMLFlag(nil, "something")(cfg)
+	err := ConfigFileLoader(nil, "something")(cfg)
 	require.Nil(t, err)
 	require.Equal(t, 0, cfg.v)
 

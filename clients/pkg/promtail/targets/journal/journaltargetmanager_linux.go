@@ -1,11 +1,11 @@
+//go:build cgo
 // +build cgo
 
 package journal
 
 import (
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
-	"github.com/prometheus/client_golang/prometheus"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 
 	"github.com/grafana/loki/clients/pkg/logentry/stages"
 	"github.com/grafana/loki/clients/pkg/promtail/api"
@@ -15,15 +15,17 @@ import (
 )
 
 // JournalTargetManager manages a series of JournalTargets.
-// nolint(golint)
+// nolint
 type JournalTargetManager struct {
 	logger  log.Logger
 	targets map[string]*JournalTarget
+
+	metrics *Metrics
 }
 
 // NewJournalTargetManager creates a new JournalTargetManager.
 func NewJournalTargetManager(
-	reg prometheus.Registerer,
+	metrics *Metrics,
 	logger log.Logger,
 	positions positions.Positions,
 	client api.EntryHandler,
@@ -32,6 +34,7 @@ func NewJournalTargetManager(
 	tm := &JournalTargetManager{
 		logger:  logger,
 		targets: make(map[string]*JournalTarget),
+		metrics: metrics,
 	}
 
 	for _, cfg := range scrapeConfigs {
@@ -39,12 +42,13 @@ func NewJournalTargetManager(
 			continue
 		}
 
-		pipeline, err := stages.NewPipeline(log.With(logger, "component", "journal_pipeline"), cfg.PipelineStages, &cfg.JobName, reg)
+		pipeline, err := stages.NewPipeline(log.With(logger, "component", "journal_pipeline"), cfg.PipelineStages, &cfg.JobName, metrics.reg)
 		if err != nil {
 			return nil, err
 		}
 
 		t, err := NewJournalTarget(
+			tm.metrics,
 			logger,
 			pipeline.Wrap(client),
 			positions,

@@ -1,8 +1,17 @@
-// +build !amd64,!arm appengine !gc noasm
+// +build !amd64,!arm,!arm64 appengine !gc noasm
 
 package lz4block
 
-func decodeBlock(dst, src []byte) (ret int) {
+import (
+	"encoding/binary"
+)
+
+func decodeBlock(dst, src, dict []byte) (ret int) {
+	// Restrict capacities so we don't read or write out of bounds.
+	dst = dst[:len(dst):len(dst)]
+	src = src[:len(src):len(src)]
+	dictLen := uint(len(dict))
+
 	const hasError = -2
 	defer func() {
 		if recover() != nil {
@@ -32,7 +41,7 @@ func decodeBlock(dst, src []byte) (ret int) {
 					// if the match length (4..18) fits within the literals, then copy
 					// all 18 bytes, even if not all are part of the literals.
 					mLen += 4
-					if offset := uint(src[si]) | uint(src[si+1])<<8; mLen <= offset {
+					if offset := u16(src[si:]); mLen <= offset && offset < di {
 						i := di - offset
 						end := i + 18
 						if end > uint(len(dst)) {
@@ -47,12 +56,16 @@ func decodeBlock(dst, src []byte) (ret int) {
 					}
 				}
 			case lLen == 0xF:
-				for src[si] == 0xFF {
-					lLen += 0xFF
+				for {
+					x := uint(src[si])
+					if lLen += x; int(lLen) < 0 {
+						return hasError
+					}
 					si++
+					if x != 0xFF {
+						break
+					}
 				}
-				lLen += uint(src[si])
-				si++
 				fallthrough
 			default:
 				copy(dst[di:di+lLen], src[si:si+lLen])
@@ -66,25 +79,60 @@ func decodeBlock(dst, src []byte) (ret int) {
 			return hasError
 		}
 
-		offset := uint(src[si]) | uint(src[si+1])<<8
+		offset := u16(src[si:])
 		if offset == 0 {
 			return hasError
 		}
 		si += 2
 
 		// Match.
-		mLen := b & 0xF
-		if mLen == 0xF {
-			for src[si] == 0xFF {
-				mLen += 0xFF
+		mLen := minMatch + b&0xF
+		if mLen == minMatch+0xF {
+			for {
+				x := uint(src[si])
+				if mLen += x; int(mLen) < 0 {
+					return hasError
+				}
 				si++
+				if x != 0xFF {
+					break
+				}
 			}
-			mLen += uint(src[si])
-			si++
 		}
-		mLen += minMatch
 
 		// Copy the match.
+		if di < offset {
+			// The match is beyond our block, meaning in the dictionary
+			if offset-di > mLen {
+				// The match is entirely contained in the dictionary. Just copy!
+				copy(dst[di:di+mLen], dict[dictLen+di-offset:dictLen+di-offset+mLen])
+				di = di + mLen
+			} else {
+				// The match stretches over the dictionary and our block
+				copySize := offset - di
+				restSize := mLen - copySize
+
+				copy(dst[di:di+copySize], dict[dictLen-copySize:])
+				di = di + copySize
+
+				if di < restSize {
+					// Overlap - we want to copy more than what we have available,
+					// so copy byte per byte.
+					copyFrom := 0
+					endOfMatch := di + restSize
+					for di < endOfMatch {
+						dst[di] = dst[copyFrom]
+						di = di + 1
+						copyFrom = copyFrom + 1
+					}
+				} else {
+					copy(dst[di:di+restSize], dst[0:restSize])
+					di = di + restSize
+				}
+			}
+			continue
+		}
+
 		expanded := dst[di-offset:]
 		if mLen > offset {
 			// Efficiently copy the match dst[di-offset:di] into the dst slice.
@@ -98,3 +146,5 @@ func decodeBlock(dst, src []byte) (ret int) {
 		di += uint(copy(dst[di:di+mLen], expanded[:mLen]))
 	}
 }
+
+func u16(p []byte) uint { return uint(binary.LittleEndian.Uint16(p)) }

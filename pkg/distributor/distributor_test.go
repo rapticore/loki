@@ -5,23 +5,22 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
-	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/ring"
-	ring_client "github.com/cortexproject/cortex/pkg/ring/client"
-	"github.com/cortexproject/cortex/pkg/ring/kv"
-	"github.com/cortexproject/cortex/pkg/ring/kv/consul"
-	"github.com/cortexproject/cortex/pkg/util/flagext"
-	"github.com/cortexproject/cortex/pkg/util/services"
-	"github.com/cortexproject/cortex/pkg/util/test"
-
+	"github.com/go-kit/log"
+	"github.com/grafana/dskit/flagext"
+	"github.com/grafana/dskit/kv"
+	"github.com/grafana/dskit/kv/consul"
+	"github.com/grafana/dskit/ring"
+	ring_client "github.com/grafana/dskit/ring/client"
+	"github.com/grafana/dskit/services"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/weaveworks/common/httpgrpc"
@@ -31,8 +30,11 @@ import (
 
 	"github.com/grafana/loki/pkg/ingester/client"
 	"github.com/grafana/loki/pkg/logproto"
+	"github.com/grafana/loki/pkg/logql/syntax"
 	"github.com/grafana/loki/pkg/runtime"
 	fe "github.com/grafana/loki/pkg/util/flagext"
+	loki_net "github.com/grafana/loki/pkg/util/net"
+	"github.com/grafana/loki/pkg/util/test"
 	"github.com/grafana/loki/pkg/validation"
 )
 
@@ -61,7 +63,7 @@ func TestDistributor(t *testing.T) {
 		},
 		{
 			lines:         100,
-			expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg, 100, 100, 1000),
+			expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg, "test", 100, 100, 1000),
 		},
 		{
 			lines:            100,
@@ -100,6 +102,241 @@ func TestDistributor(t *testing.T) {
 	}
 }
 
+func Test_IncrementTimestamp(t *testing.T) {
+	incrementingDisabled := &validation.Limits{}
+	flagext.DefaultValues(incrementingDisabled)
+	incrementingDisabled.RejectOldSamples = false
+
+	incrementingEnabled := &validation.Limits{}
+	flagext.DefaultValues(incrementingEnabled)
+	incrementingEnabled.RejectOldSamples = false
+	incrementingEnabled.IncrementDuplicateTimestamp = true
+
+	tests := map[string]struct {
+		limits       *validation.Limits
+		push         *logproto.PushRequest
+		expectedPush *logproto.PushRequest
+	}{
+		"incrementing disabled, no dupes": {
+			limits: incrementingDisabled,
+			push: &logproto.PushRequest{
+				Streams: []logproto.Stream{
+					{
+						Labels: "{job=\"foo\"}",
+						Entries: []logproto.Entry{
+							{Timestamp: time.Unix(123456, 0), Line: "heyooooooo"},
+							{Timestamp: time.Unix(123457, 0), Line: "heyiiiiiii"},
+						},
+					},
+				},
+			},
+			expectedPush: &logproto.PushRequest{
+				Streams: []logproto.Stream{
+					{
+						Labels: "{job=\"foo\"}",
+						Entries: []logproto.Entry{
+							{Timestamp: time.Unix(123456, 0), Line: "heyooooooo"},
+							{Timestamp: time.Unix(123457, 0), Line: "heyiiiiiii"},
+						},
+					},
+				},
+			},
+		},
+		"incrementing disabled, with dupe timestamp different entry": {
+			limits: incrementingDisabled,
+			push: &logproto.PushRequest{
+				Streams: []logproto.Stream{
+					{
+						Labels: "{job=\"foo\"}",
+						Entries: []logproto.Entry{
+							{Timestamp: time.Unix(123456, 0), Line: "heyooooooo"},
+							{Timestamp: time.Unix(123456, 0), Line: "heyiiiiiii"},
+						},
+					},
+				},
+			},
+			expectedPush: &logproto.PushRequest{
+				Streams: []logproto.Stream{
+					{
+						Labels: "{job=\"foo\"}",
+						Entries: []logproto.Entry{
+							{Timestamp: time.Unix(123456, 0), Line: "heyooooooo"},
+							{Timestamp: time.Unix(123456, 0), Line: "heyiiiiiii"},
+						},
+					},
+				},
+			},
+		},
+		"incrementing disabled, with dupe timestamp same entry": {
+			limits: incrementingDisabled,
+			push: &logproto.PushRequest{
+				Streams: []logproto.Stream{
+					{
+						Labels: "{job=\"foo\"}",
+						Entries: []logproto.Entry{
+							{Timestamp: time.Unix(123456, 0), Line: "heyooooooo"},
+							{Timestamp: time.Unix(123456, 0), Line: "heyooooooo"},
+						},
+					},
+				},
+			},
+			expectedPush: &logproto.PushRequest{
+				Streams: []logproto.Stream{
+					{
+						Labels: "{job=\"foo\"}",
+						Entries: []logproto.Entry{
+							{Timestamp: time.Unix(123456, 0), Line: "heyooooooo"},
+							{Timestamp: time.Unix(123456, 0), Line: "heyooooooo"},
+						},
+					},
+				},
+			},
+		},
+		"incrementing enabled, no dupes": {
+			limits: incrementingEnabled,
+			push: &logproto.PushRequest{
+				Streams: []logproto.Stream{
+					{
+						Labels: "{job=\"foo\"}",
+						Entries: []logproto.Entry{
+							{Timestamp: time.Unix(123456, 0), Line: "heyooooooo"},
+							{Timestamp: time.Unix(123457, 0), Line: "heyiiiiiii"},
+						},
+					},
+				},
+			},
+			expectedPush: &logproto.PushRequest{
+				Streams: []logproto.Stream{
+					{
+						Labels: "{job=\"foo\"}",
+						Entries: []logproto.Entry{
+							{Timestamp: time.Unix(123456, 0), Line: "heyooooooo"},
+							{Timestamp: time.Unix(123457, 0), Line: "heyiiiiiii"},
+						},
+					},
+				},
+			},
+		},
+		"incrementing enabled, with dupe timestamp different entry": {
+			limits: incrementingEnabled,
+			push: &logproto.PushRequest{
+				Streams: []logproto.Stream{
+					{
+						Labels: "{job=\"foo\"}",
+						Entries: []logproto.Entry{
+							{Timestamp: time.Unix(123456, 0), Line: "heyooooooo"},
+							{Timestamp: time.Unix(123456, 0), Line: "heyiiiiiii"},
+						},
+					},
+				},
+			},
+			expectedPush: &logproto.PushRequest{
+				Streams: []logproto.Stream{
+					{
+						Labels: "{job=\"foo\"}",
+						Entries: []logproto.Entry{
+							{Timestamp: time.Unix(123456, 0), Line: "heyooooooo"},
+							{Timestamp: time.Unix(123456, 1), Line: "heyiiiiiii"},
+						},
+					},
+				},
+			},
+		},
+		"incrementing enabled, with dupe timestamp same entry": {
+			limits: incrementingEnabled,
+			push: &logproto.PushRequest{
+				Streams: []logproto.Stream{
+					{
+						Labels: "{job=\"foo\"}",
+						Entries: []logproto.Entry{
+							{Timestamp: time.Unix(123456, 0), Line: "heyooooooo"},
+							{Timestamp: time.Unix(123456, 0), Line: "heyooooooo"},
+						},
+					},
+				},
+			},
+			expectedPush: &logproto.PushRequest{
+				Streams: []logproto.Stream{
+					{
+						Labels: "{job=\"foo\"}",
+						Entries: []logproto.Entry{
+							{Timestamp: time.Unix(123456, 0), Line: "heyooooooo"},
+							{Timestamp: time.Unix(123456, 0), Line: "heyooooooo"},
+						},
+					},
+				},
+			},
+		},
+		"incrementing enabled, multiple repeated-timestamps": {
+			limits: incrementingEnabled,
+			push: &logproto.PushRequest{
+				Streams: []logproto.Stream{
+					{
+						Labels: "{job=\"foo\"}",
+						Entries: []logproto.Entry{
+							{Timestamp: time.Unix(123456, 0), Line: "heyooooooo"},
+							{Timestamp: time.Unix(123456, 0), Line: "hi"},
+							{Timestamp: time.Unix(123456, 0), Line: "hey there"},
+						},
+					},
+				},
+			},
+			expectedPush: &logproto.PushRequest{
+				Streams: []logproto.Stream{
+					{
+						Labels: "{job=\"foo\"}",
+						Entries: []logproto.Entry{
+							{Timestamp: time.Unix(123456, 0), Line: "heyooooooo"},
+							{Timestamp: time.Unix(123456, 1), Line: "hi"},
+							{Timestamp: time.Unix(123456, 2), Line: "hey there"},
+						},
+					},
+				},
+			},
+		},
+		"incrementing enabled, multiple subsequent increments": {
+			limits: incrementingEnabled,
+			push: &logproto.PushRequest{
+				Streams: []logproto.Stream{
+					{
+						Labels: "{job=\"foo\"}",
+						Entries: []logproto.Entry{
+							{Timestamp: time.Unix(123456, 0), Line: "heyooooooo"},
+							{Timestamp: time.Unix(123456, 0), Line: "hi"},
+							{Timestamp: time.Unix(123456, 1), Line: "hey there"},
+						},
+					},
+				},
+			},
+			expectedPush: &logproto.PushRequest{
+				Streams: []logproto.Stream{
+					{
+						Labels: "{job=\"foo\"}",
+						Entries: []logproto.Entry{
+							{Timestamp: time.Unix(123456, 0), Line: "heyooooooo"},
+							{Timestamp: time.Unix(123456, 1), Line: "hi"},
+							{Timestamp: time.Unix(123456, 2), Line: "hey there"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for testName, testData := range tests {
+		testData := testData
+
+		t.Run(testName, func(t *testing.T) {
+			ingester := &mockIngester{}
+			d := prepare(t, testData.limits, nil, func(addr string) (ring_client.PoolClient, error) { return ingester, nil })
+			defer services.StopAndAwaitTerminated(context.Background(), d) //nolint:errcheck
+			_, err := d.Push(ctx, testData.push)
+			assert.NoError(t, err)
+			assert.Equal(t, testData.expectedPush, ingester.pushed[0])
+		})
+	}
+}
+
 func Test_SortLabelsOnPush(t *testing.T) {
 	limits := &validation.Limits{}
 	flagext.DefaultValues(limits)
@@ -115,6 +352,351 @@ func Test_SortLabelsOnPush(t *testing.T) {
 	require.Equal(t, `{a="b", buzz="f"}`, ingester.pushed[0].Streams[0].Labels)
 }
 
+func Test_TruncateLogLines(t *testing.T) {
+	setup := func() (*validation.Limits, *mockIngester) {
+		limits := &validation.Limits{}
+		flagext.DefaultValues(limits)
+
+		limits.EnforceMetricName = false
+		limits.MaxLineSize = 5
+		limits.MaxLineSizeTruncate = true
+		return limits, &mockIngester{}
+	}
+
+	t.Run("it truncates lines to MaxLineSize when MaxLineSizeTruncate is true", func(t *testing.T) {
+		limits, ingester := setup()
+
+		d := prepare(t, limits, nil, func(addr string) (ring_client.PoolClient, error) { return ingester, nil })
+		defer services.StopAndAwaitTerminated(context.Background(), d) //nolint:errcheck
+
+		_, err := d.Push(ctx, makeWriteRequest(1, 10))
+		require.NoError(t, err)
+		require.Len(t, ingester.pushed[0].Streams[0].Entries[0].Line, 5)
+	})
+}
+
+func TestStreamShard(t *testing.T) {
+	// setup base stream.
+	baseStream := logproto.Stream{}
+	baseLabels := "{app='myapp', job='fizzbuzz'}"
+	lbs, err := syntax.ParseLabels(baseLabels)
+	require.NoError(t, err)
+	baseStream.Hash = lbs.Hash()
+	baseStream.Labels = lbs.String()
+
+	// helper funcs
+	generateEntries := func(n int) []logproto.Entry {
+		var entries []logproto.Entry
+		for i := 0; i < n; i++ {
+			entries = append(entries, logproto.Entry{
+				Line:      fmt.Sprintf("log line %d", i),
+				Timestamp: time.Now(),
+			})
+		}
+		return entries
+	}
+	generateShardLabels := func(baseLabels string, idx int) labels.Labels {
+		// append a shard label to the given labels. The shard value will be 'idx'.
+		lbs, err := syntax.ParseLabels(baseLabels)
+		require.NoError(t, err)
+		lbs = append(lbs, labels.Label{Name: ShardLbName, Value: fmt.Sprintf("%d", idx)})
+		return lbs
+	}
+
+	totalEntries := generateEntries(100)
+
+	for _, tc := range []struct {
+		name              string
+		entries           []logproto.Entry
+		shards            int // stub call to ShardCountFor.
+		wantDerivedStream []streamTracker
+	}{
+		{
+			name:              "one shard with no entries",
+			entries:           nil,
+			shards:            1,
+			wantDerivedStream: []streamTracker{{stream: baseStream}},
+		},
+		{
+			name:    "one shard with one entry",
+			shards:  1,
+			entries: totalEntries[0:1],
+			wantDerivedStream: []streamTracker{
+				{
+					stream: logproto.Stream{
+						Entries: []logproto.Entry{totalEntries[0]},
+						Labels:  baseStream.Labels,
+						Hash:    baseStream.Hash,
+					},
+				},
+			},
+		},
+		{
+			name:    "two shards with 3 entries",
+			shards:  2,
+			entries: totalEntries[0:3],
+			wantDerivedStream: []streamTracker{
+				{ // shard 1.
+					stream: logproto.Stream{
+						Entries: totalEntries[0:1],
+						Labels:  generateShardLabels(baseLabels, 0).String(),
+						Hash:    generateShardLabels(baseLabels, 0).Hash(),
+					},
+				}, // shard 2.
+				{
+					stream: logproto.Stream{
+						Entries: totalEntries[1:3],
+						Labels:  generateShardLabels(baseLabels, 1).String(),
+						Hash:    generateShardLabels(baseLabels, 1).Hash(),
+					},
+				},
+			},
+		},
+		{
+			name:    "two shards with 5 entries",
+			shards:  2,
+			entries: totalEntries[0:5],
+			wantDerivedStream: []streamTracker{
+				{ // shard 1.
+					stream: logproto.Stream{
+						Entries: totalEntries[0:2],
+						Labels:  generateShardLabels(baseLabels, 0).String(),
+						Hash:    generateShardLabels(baseLabels, 0).Hash(),
+					},
+				}, // shard 2.
+				{
+					stream: logproto.Stream{
+						Entries: totalEntries[2:5],
+						Labels:  generateShardLabels(baseLabels, 1).String(),
+						Hash:    generateShardLabels(baseLabels, 1).Hash(),
+					},
+				},
+			},
+		},
+		{
+			name:    "one shard with 20 entries",
+			shards:  1,
+			entries: totalEntries[0:20],
+			wantDerivedStream: []streamTracker{
+				{ // shard 1.
+					stream: logproto.Stream{
+						Entries: totalEntries[0:20],
+						Labels:  baseStream.Labels,
+						Hash:    baseStream.Hash,
+					},
+				},
+			},
+		},
+		{
+			name:    "two shards with 20 entries",
+			shards:  2,
+			entries: totalEntries[0:20],
+			wantDerivedStream: []streamTracker{
+				{ // shard 1.
+					stream: logproto.Stream{
+						Entries: totalEntries[0:10],
+						Labels:  generateShardLabels(baseLabels, 0).String(),
+						Hash:    generateShardLabels(baseLabels, 0).Hash(),
+					},
+				}, // shard 2.
+				{
+					stream: logproto.Stream{
+						Entries: totalEntries[10:20],
+						Labels:  generateShardLabels(baseLabels, 1).String(),
+						Hash:    generateShardLabels(baseLabels, 1).Hash(),
+					},
+				},
+			},
+		},
+		{
+			name:    "four shards with 20 entries",
+			shards:  4,
+			entries: totalEntries[0:20],
+			wantDerivedStream: []streamTracker{
+				{ // shard 1.
+					stream: logproto.Stream{
+						Entries: totalEntries[0:5],
+						Labels:  generateShardLabels(baseLabels, 0).String(),
+						Hash:    generateShardLabels(baseLabels, 0).Hash(),
+					},
+				},
+				{ // shard 2.
+					stream: logproto.Stream{
+						Entries: totalEntries[5:10],
+						Labels:  generateShardLabels(baseLabels, 1).String(),
+						Hash:    generateShardLabels(baseLabels, 1).Hash(),
+					},
+				},
+				{ // shard 3.
+					stream: logproto.Stream{
+						Entries: totalEntries[10:15],
+						Labels:  generateShardLabels(baseLabels, 2).String(),
+						Hash:    generateShardLabels(baseLabels, 2).Hash(),
+					},
+				},
+				{ // shard 4.
+					stream: logproto.Stream{
+						Entries: totalEntries[15:20],
+						Labels:  generateShardLabels(baseLabels, 3).String(),
+						Hash:    generateShardLabels(baseLabels, 3).Hash(),
+					},
+				},
+			},
+		},
+		{
+			name:    "four shards with 2 entries",
+			shards:  4,
+			entries: totalEntries[0:2],
+			wantDerivedStream: []streamTracker{
+				{
+					stream: logproto.Stream{
+						Entries: []logproto.Entry{},
+						Labels:  generateShardLabels(baseLabels, 0).String(),
+						Hash:    generateShardLabels(baseLabels, 0).Hash(),
+					},
+				},
+				{
+					stream: logproto.Stream{
+						Entries: totalEntries[0:1],
+						Labels:  generateShardLabels(baseLabels, 1).String(),
+						Hash:    generateShardLabels(baseLabels, 1).Hash(),
+					},
+				},
+				{
+					stream: logproto.Stream{
+						Entries: []logproto.Entry{},
+						Labels:  generateShardLabels(baseLabels, 2).String(),
+						Hash:    generateShardLabels(baseLabels, 2).Hash(),
+					},
+				},
+				{
+					stream: logproto.Stream{
+						Entries: totalEntries[1:2],
+						Labels:  generateShardLabels(baseLabels, 3).String(),
+						Hash:    generateShardLabels(baseLabels, 3).Hash(),
+					},
+				},
+			},
+		},
+		{
+			name:    "four shards with 1 entry",
+			shards:  4,
+			entries: totalEntries[0:1],
+			wantDerivedStream: []streamTracker{
+				{
+					stream: logproto.Stream{
+						Labels:  generateShardLabels(baseLabels, 0).String(),
+						Hash:    generateShardLabels(baseLabels, 0).Hash(),
+						Entries: []logproto.Entry{},
+					},
+				},
+				{
+					stream: logproto.Stream{
+						Labels:  generateShardLabels(baseLabels, 1).String(),
+						Hash:    generateShardLabels(baseLabels, 1).Hash(),
+						Entries: []logproto.Entry{},
+					},
+				},
+				{
+					stream: logproto.Stream{
+						Labels:  generateShardLabels(baseLabels, 2).String(),
+						Hash:    generateShardLabels(baseLabels, 2).Hash(),
+						Entries: []logproto.Entry{},
+					},
+				},
+				{
+					stream: logproto.Stream{
+						Entries: totalEntries[0:1],
+						Labels:  generateShardLabels(baseLabels, 3).String(),
+						Hash:    generateShardLabels(baseLabels, 3).Hash(),
+					},
+				},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := Distributor{
+				streamSharder: NewStreamSharderMock(tc.shards),
+			}
+			baseStream.Entries = tc.entries
+
+			_, derivedStreams := d.shardStream(baseStream, "fake")
+
+			require.Equal(t, tc.wantDerivedStream, derivedStreams)
+		})
+	}
+}
+
+func BenchmarkShardStream(b *testing.B) {
+	stream := logproto.Stream{}
+	labels := "{app='myapp', job='fizzbuzz'}"
+	lbs, err := syntax.ParseLabels(labels)
+	require.NoError(b, err)
+	stream.Hash = lbs.Hash()
+	stream.Labels = lbs.String()
+
+	// helper funcs
+	generateEntries := func(n int) []logproto.Entry {
+		var entries []logproto.Entry
+		for i := 0; i < n; i++ {
+			entries = append(entries, logproto.Entry{
+				Line:      fmt.Sprintf("log line %d", i),
+				Timestamp: time.Now(),
+			})
+		}
+		return entries
+	}
+	allEntries := generateEntries(25000)
+
+	b.Run("high number of entries, low number of shards", func(b *testing.B) {
+		d := Distributor{
+			streamSharder: NewStreamSharderMock(2),
+		}
+		stream.Entries = allEntries
+
+		b.ResetTimer()
+		for n := 0; n < b.N; n++ {
+			d.shardStream(stream, "fake")
+		}
+	})
+
+	b.Run("low number of entries, low number of shards", func(b *testing.B) {
+		d := Distributor{
+			streamSharder: NewStreamSharderMock(2),
+		}
+		stream.Entries = nil
+
+		b.ResetTimer()
+		for n := 0; n < b.N; n++ {
+			d.shardStream(stream, "fake")
+		}
+	})
+
+	b.Run("high number of entries, high number of shards", func(b *testing.B) {
+		d := Distributor{
+			streamSharder: NewStreamSharderMock(64),
+		}
+		stream.Entries = allEntries
+
+		b.ResetTimer()
+		for n := 0; n < b.N; n++ {
+			d.shardStream(stream, "fake")
+		}
+	})
+
+	b.Run("low number of entries, high number of shards", func(b *testing.B) {
+		d := Distributor{
+			streamSharder: NewStreamSharderMock(64),
+		}
+		stream.Entries = nil
+
+		b.ResetTimer()
+		for n := 0; n < b.N; n++ {
+			d.shardStream(stream, "fake")
+		}
+	})
+}
+
 func Benchmark_SortLabelsOnPush(b *testing.B) {
 	limits := &validation.Limits{}
 	flagext.DefaultValues(limits)
@@ -123,7 +705,7 @@ func Benchmark_SortLabelsOnPush(b *testing.B) {
 	d := prepare(&testing.T{}, limits, nil, func(addr string) (ring_client.PoolClient, error) { return ingester, nil })
 	defer services.StopAndAwaitTerminated(context.Background(), d) //nolint:errcheck
 	request := makeWriteRequest(10, 10)
-	vCtx := d.validator.getValidationContextFor("123")
+	vCtx := d.validator.getValidationContextForTime(testTime, "123")
 	for n := 0; n < b.N; n++ {
 		stream := request.Streams[0]
 		stream.Labels = `{buzz="f", a="b"}`
@@ -162,6 +744,31 @@ func Benchmark_Push(b *testing.B) {
 	}
 }
 
+func Benchmark_PushWithLineTruncation(b *testing.B) {
+	limits := &validation.Limits{}
+	flagext.DefaultValues(limits)
+
+	limits.IngestionRateMB = math.MaxInt32
+	limits.MaxLineSizeTruncate = true
+	limits.MaxLineSize = 50
+
+	ingester := &mockIngester{}
+	d := prepare(&testing.T{}, limits, nil, func(addr string) (ring_client.PoolClient, error) { return ingester, nil })
+	defer services.StopAndAwaitTerminated(context.Background(), d) //nolint:errcheck
+	request := makeWriteRequest(100000, 100)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for n := 0; n < b.N; n++ {
+
+		_, err := d.Push(ctx, request)
+		if err != nil {
+			require.NoError(b, err)
+		}
+	}
+}
+
 func TestDistributor_PushIngestionRateLimiter(t *testing.T) {
 	type testPush struct {
 		bytes         int
@@ -182,9 +789,9 @@ func TestDistributor_PushIngestionRateLimiter(t *testing.T) {
 			ingestionBurstSizeMB:  10 * (1.0 / float64(bytesInMB)),
 			pushes: []testPush{
 				{bytes: 5, expectedError: nil},
-				{bytes: 6, expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg, 10, 1, 6)},
+				{bytes: 6, expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg, "test", 10, 1, 6)},
 				{bytes: 5, expectedError: nil},
-				{bytes: 1, expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg, 10, 1, 1)},
+				{bytes: 1, expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg, "test", 10, 1, 1)},
 			},
 		},
 		"global strategy: limit should be evenly shared across distributors": {
@@ -194,9 +801,9 @@ func TestDistributor_PushIngestionRateLimiter(t *testing.T) {
 			ingestionBurstSizeMB:  5 * (1.0 / float64(bytesInMB)),
 			pushes: []testPush{
 				{bytes: 3, expectedError: nil},
-				{bytes: 3, expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg, 5, 1, 3)},
+				{bytes: 3, expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg, "test", 5, 1, 3)},
 				{bytes: 2, expectedError: nil},
-				{bytes: 1, expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg, 5, 1, 1)},
+				{bytes: 1, expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg, "test", 5, 1, 1)},
 			},
 		},
 		"global strategy: burst should set to each distributor": {
@@ -206,9 +813,9 @@ func TestDistributor_PushIngestionRateLimiter(t *testing.T) {
 			ingestionBurstSizeMB:  20 * (1.0 / float64(bytesInMB)),
 			pushes: []testPush{
 				{bytes: 15, expectedError: nil},
-				{bytes: 6, expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg, 5, 1, 6)},
+				{bytes: 6, expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg, "test", 5, 1, 6)},
 				{bytes: 5, expectedError: nil},
-				{bytes: 1, expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg, 5, 1, 1)},
+				{bytes: 1, expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg, "test", 5, 1, 1)},
 			},
 		},
 	}
@@ -225,7 +832,8 @@ func TestDistributor_PushIngestionRateLimiter(t *testing.T) {
 			limits.IngestionBurstSizeMB = testData.ingestionBurstSizeMB
 
 			// Init a shared KVStore
-			kvStore := consul.NewInMemoryClient(ring.GetCodec())
+			kvStore, closer := consul.NewInMemoryClient(ring.GetCodec(), log.NewNopLogger(), nil)
+			t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
 			// Start all expected distributors
 			distributors := make([]*Distributor, testData.distributors)
@@ -236,9 +844,9 @@ func TestDistributor_PushIngestionRateLimiter(t *testing.T) {
 
 			// If the distributors ring is setup, wait until the first distributor
 			// updates to the expected size
-			if distributors[0].distributorsRing != nil {
+			if distributors[0].distributorsLifecycler != nil {
 				test.Poll(t, time.Second, testData.distributors, func() interface{} {
-					return distributors[0].distributorsRing.HealthyInstancesCount()
+					return distributors[0].distributorsLifecycler.HealthyInstancesCount()
 				})
 			}
 
@@ -257,23 +865,6 @@ func TestDistributor_PushIngestionRateLimiter(t *testing.T) {
 			}
 		})
 	}
-}
-
-// loopbackInterfaceName search for the name of a loopback interface in the list
-// of the system's network interfaces.
-func loopbackInterfaceName() (string, error) {
-	is, err := net.Interfaces()
-	if err != nil {
-		return "", fmt.Errorf("can't retrieve loopback interface name: %s", err)
-	}
-
-	for _, i := range is {
-		if i.Flags&net.FlagLoopback != 0 {
-			return i.Name, nil
-		}
-	}
-
-	return "", fmt.Errorf("can't retrieve loopback interface name")
 }
 
 func prepare(t *testing.T, limits *validation.Limits, kvStore kv.Client, factory func(addr string) (ring_client.PoolClient, error)) *Distributor {
@@ -301,12 +892,13 @@ func prepare(t *testing.T, limits *validation.Limits, kvStore kv.Client, factory
 		})
 	}
 
-	loopbackName, err := loopbackInterfaceName()
+	loopbackName, err := loki_net.LoopbackInterfaceName()
 	require.NoError(t, err)
 
 	distributorConfig.DistributorRing.HeartbeatPeriod = 100 * time.Millisecond
 	distributorConfig.DistributorRing.InstanceID = strconv.Itoa(rand.Int())
 	distributorConfig.DistributorRing.KVStore.Mock = kvStore
+	distributorConfig.DistributorRing.KVStore.Store = "inmemory"
 	distributorConfig.DistributorRing.InstanceInterfaceNames = []string{loopbackName}
 	distributorConfig.factory = factory
 	if factory == nil {
@@ -424,3 +1016,7 @@ func (r mockRing) ShuffleShardWithLookback(identifier string, size int, lookback
 }
 
 func (r mockRing) CleanupShuffleShardCache(identifier string) {}
+
+func (r mockRing) GetInstanceState(instanceID string) (ring.InstanceState, error) {
+	return 0, nil
+}

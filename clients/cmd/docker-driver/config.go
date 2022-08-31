@@ -10,14 +10,14 @@ import (
 	"strings"
 	"time"
 
-	cortex_util "github.com/cortexproject/cortex/pkg/util"
-	"github.com/cortexproject/cortex/pkg/util/flagext"
 	"github.com/docker/docker/daemon/logger"
 	"github.com/docker/docker/daemon/logger/templates"
+	"github.com/grafana/dskit/backoff"
+	"github.com/grafana/dskit/flagext"
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/pkg/relabel"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/relabel"
 	"gopkg.in/yaml.v2"
 
 	"github.com/grafana/loki/clients/pkg/logentry/stages"
@@ -71,7 +71,7 @@ var (
 	defaultClientConfig = client.Config{
 		BatchWait: client.BatchWait,
 		BatchSize: client.BatchSize,
-		BackoffConfig: cortex_util.BackoffConfig{
+		BackoffConfig: backoff.Config{
 			MinBackoff: client.MinBackoff,
 			MaxBackoff: client.MaxBackoff,
 			MaxRetries: client.MaxRetries,

@@ -1,9 +1,10 @@
 ---
 title: Logstash
+weight: 70
 ---
 # Logstash
 
-Loki has a [Logstash](https://www.elastic.co/logstash) output plugin called
+Grafana Loki has a [Logstash](https://www.elastic.co/logstash) output plugin called
 `logstash-output-loki` that enables shipping logs to a Loki
 instance or [Grafana Cloud](https://grafana.com/products/cloud/).
 
@@ -32,7 +33,7 @@ docker run -v `pwd`/loki-test.conf:/home/logstash/ --rm grafana/logstash-output-
 
 ### Kubernetes
 
-We also provides default helm values for scraping logs with Filebeat and forward them to Loki with logstash in our `loki-stack` umbrella chart.
+We also provide default helm values for scraping logs with Filebeat and forward them to Loki with logstash in our `loki-stack` umbrella chart.
 You can switch from Promtail to logstash by using the following command:
 
 ```bash
@@ -56,6 +57,8 @@ output {
     [tenant_id => string | default = nil | required=false]
 
     [message_field => string | default = "message" | required=false]
+    
+    [include_fields => array | default = [] | required=false]
 
     [batch_wait => number | default = 1(s) | required=false]
 
@@ -77,7 +80,7 @@ output {
 
     [ca_cert => path | default = nil | required=false]
 
-    [insecure_skip_verify => boolean | default = fasle | required=false]
+    [insecure_skip_verify => boolean | default = false | required=false]
   }
 }
 ```
@@ -104,6 +107,8 @@ Contains a `message` and `@timestamp` fields, which are respectively used to for
 
 All other fields (except nested fields) will form the label set (key value pairs) attached to the log line. [This means you're responsible for mutating and dropping high cardinality labels](https://grafana.com/blog/2020/04/21/how-labels-in-loki-can-make-log-queries-faster-and-easier/) such as client IPs.
 You can usually do so by using a [`mutate`](https://www.elastic.co/guide/en/logstash/current/plugins-filters-mutate.html) filter.
+
+**Note:** In version 1.1.0 and greater of this plugin you can also specify a list of labels to allowlist via the `include_fields` configuration.
 
 For example the configuration below :
 
@@ -203,6 +208,10 @@ If using the [GrafanaLab's hosted Loki](https://grafana.com/products/cloud/), th
 
 Message field to use for log lines. You can use logstash key accessor language to grab nested property, for example : `[log][message]`.
 
+#### include_fields
+
+An array of fields which will be mapped to labels and sent to Loki, when this list is configured **only** these fields will be sent, all other fields will be ignored.
+
 #### batch_wait
 
 Interval in seconds to wait before pushing a batch of records to Loki. This means even if the [batch size](#batch_size) is not reached after `batch_wait` a partial batch will be sent, this is to ensure freshness of the data.
@@ -223,7 +232,7 @@ Maximum backoff time between retries
 
 ##### retries => 10
 
-Maximum number of retries to do
+Maximum number of retries to do. Setting it to `0` will retry indefinitely.
 
 #### tenant_id
 
@@ -258,7 +267,7 @@ filter {
     }
   }
   mutate {
-    remove_field => ["tags"]
+    remove_field => ["tags"]  # Note: with include_fields defined below this wouldn't be necessary
   }
 }
 
@@ -272,6 +281,7 @@ output {
     min_delay => 3
     max_delay => 500
     message_field => "message"
+    include_fields => ["container_name","namespace","pod","host"]
   }
   # stdout { codec => rubydebug }
 }

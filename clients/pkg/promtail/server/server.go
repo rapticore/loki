@@ -14,8 +14,8 @@ import (
 	"text/template"
 
 	"github.com/felixge/fgprof"
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/version"
 	serverww "github.com/weaveworks/common/server"
@@ -36,12 +36,13 @@ type Server interface {
 }
 
 // Server embed weaveworks server with static file and templating capability
-type server struct {
+type PromtailServer struct {
 	*serverww.Server
 	log               log.Logger
 	tms               *targets.TargetManagers
 	externalURL       *url.URL
 	healthCheckTarget bool
+	promtailCfg       string
 }
 
 // Config extends weaveworks server config
@@ -67,7 +68,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 }
 
 // New makes a new Server
-func New(cfg Config, log log.Logger, tms *targets.TargetManagers) (Server, error) {
+func New(cfg Config, log log.Logger, tms *targets.TargetManagers, promtailCfg string) (Server, error) {
 	if cfg.Disable {
 		return newNoopServer(log), nil
 	}
@@ -80,32 +81,34 @@ func New(cfg Config, log log.Logger, tms *targets.TargetManagers) (Server, error
 	if err != nil {
 		return nil, errors.Wrapf(err, "parse external URL %q", cfg.ExternalURL)
 	}
-	cfg.PathPrefix = externalURL.Path
+	externalURL.Path += cfg.PathPrefix
 
 	healthCheckTargetFlag := true
 	if cfg.HealthCheckTarget != nil {
 		healthCheckTargetFlag = *cfg.HealthCheckTarget
 	}
 
-	serv := &server{
+	serv := &PromtailServer{
 		Server:            wws,
 		log:               log,
 		tms:               tms,
 		externalURL:       externalURL,
 		healthCheckTarget: healthCheckTargetFlag,
+		promtailCfg:       promtailCfg,
 	}
 
 	serv.HTTP.Path("/").Handler(http.RedirectHandler(path.Join(serv.externalURL.Path, "/targets"), 303))
 	serv.HTTP.Path("/ready").Handler(http.HandlerFunc(serv.ready))
-	serv.HTTP.PathPrefix("/static/").Handler(http.FileServer(ui.Assets))
+	serv.HTTP.PathPrefix("/static/").Handler(http.StripPrefix(externalURL.Path, http.FileServer(ui.Assets)))
 	serv.HTTP.Path("/service-discovery").Handler(http.HandlerFunc(serv.serviceDiscovery))
 	serv.HTTP.Path("/targets").Handler(http.HandlerFunc(serv.targets))
+	serv.HTTP.Path("/config").Handler(http.HandlerFunc(serv.config))
 	serv.HTTP.Path("/debug/fgprof").Handler(fgprof.Handler())
 	return serv, nil
 }
 
 // serviceDiscovery serves the service discovery page.
-func (s *server) serviceDiscovery(rw http.ResponseWriter, req *http.Request) {
+func (s *PromtailServer) serviceDiscovery(rw http.ResponseWriter, req *http.Request) {
 	var index []string
 	allTarget := s.tms.AllTargets()
 	for job := range allTarget {
@@ -172,8 +175,18 @@ func (s *server) serviceDiscovery(rw http.ResponseWriter, req *http.Request) {
 	})
 }
 
+func (s *PromtailServer) config(rw http.ResponseWriter, req *http.Request) {
+	executeTemplate(req.Context(), rw, templateOptions{
+		Data:         s.promtailCfg,
+		BuildVersion: version.Info(),
+		Name:         "config.html",
+		PageTitle:    "Config",
+		ExternalURL:  s.externalURL,
+	})
+}
+
 // targets serves the targets page.
-func (s *server) targets(rw http.ResponseWriter, req *http.Request) {
+func (s *PromtailServer) targets(rw http.ResponseWriter, req *http.Request) {
 	executeTemplate(req.Context(), rw, templateOptions{
 		Data: struct {
 			TargetPools map[string][]target.Target
@@ -206,7 +219,7 @@ func (s *server) targets(rw http.ResponseWriter, req *http.Request) {
 }
 
 // ready serves the ready endpoint
-func (s *server) ready(rw http.ResponseWriter, _ *http.Request) {
+func (s *PromtailServer) ready(rw http.ResponseWriter, _ *http.Request) {
 	if s.healthCheckTarget && !s.tms.Ready() {
 		http.Error(rw, readinessProbeFailure, http.StatusInternalServerError)
 		return

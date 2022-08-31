@@ -8,12 +8,17 @@ import (
 	"C"
 
 	"github.com/fluent/fluent-bit-go/output"
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/prometheus/common/version"
 	"github.com/weaveworks/common/logging"
 
 	_ "github.com/grafana/loki/pkg/util/build"
+)
+import (
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/grafana/loki/clients/pkg/promtail/client"
 )
 
 var (
@@ -83,7 +88,8 @@ func FLBPluginInit(ctx unsafe.Pointer) int {
 	level.Info(paramLogger).Log("key_file", conf.clientConfig.Client.TLSConfig.KeyFile)
 	level.Info(paramLogger).Log("insecure_skip_verify", conf.clientConfig.Client.TLSConfig.InsecureSkipVerify)
 
-	plugin, err := newPlugin(conf, logger)
+	m := client.NewMetrics(prometheus.DefaultRegisterer, nil)
+	plugin, err := newPlugin(conf, logger, m)
 	if err != nil {
 		level.Error(logger).Log("newPlugin", err)
 		return output.FLB_ERROR

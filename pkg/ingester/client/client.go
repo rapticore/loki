@@ -5,8 +5,7 @@ import (
 	"io"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/distributor"
-	"github.com/cortexproject/cortex/pkg/util/grpcclient"
+	"github.com/grafana/dskit/grpcclient"
 	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
 	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/client_golang/prometheus"
@@ -15,8 +14,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health/grpc_health_v1"
 
-	cortex_middleware "github.com/cortexproject/cortex/pkg/util/middleware"
-
+	"github.com/grafana/loki/pkg/distributor/clientpool"
 	"github.com/grafana/loki/pkg/logproto"
 )
 
@@ -42,7 +40,7 @@ type ClosableHealthAndIngesterClient struct {
 
 // Config for an ingester client.
 type Config struct {
-	PoolConfig                   distributor.PoolConfig         `yaml:"pool_config,omitempty"`
+	PoolConfig                   clientpool.PoolConfig          `yaml:"pool_config,omitempty"`
 	RemoteTimeout                time.Duration                  `yaml:"remote_timeout,omitempty"`
 	GRPCClientConfig             grpcclient.Config              `yaml:"grpc_client_config"`
 	GRPCUnaryClientInterceptors  []grpc.UnaryClientInterceptor  `yaml:"-"`
@@ -61,7 +59,6 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 // New returns a new ingester client.
 func New(cfg Config, addr string) (HealthAndIngesterClient, error) {
 	opts := []grpc.DialOption{
-		grpc.WithInsecure(),
 		grpc.WithDefaultCallOptions(cfg.GRPCClientConfig.CallOptions()...),
 	}
 
@@ -90,14 +87,14 @@ func instrumentation(cfg *Config) ([]grpc.UnaryClientInterceptor, []grpc.StreamC
 	unaryInterceptors = append(unaryInterceptors,
 		otgrpc.OpenTracingClientInterceptor(opentracing.GlobalTracer()),
 		middleware.ClientUserHeaderInterceptor,
-		cortex_middleware.PrometheusGRPCUnaryInstrumentation(ingesterClientRequestDuration),
+		middleware.UnaryClientInstrumentInterceptor(ingesterClientRequestDuration),
 	)
 	var streamInterceptors []grpc.StreamClientInterceptor
 	streamInterceptors = append(streamInterceptors, cfg.GRCPStreamClientInterceptors...)
 	streamInterceptors = append(streamInterceptors,
 		otgrpc.OpenTracingStreamClientInterceptor(opentracing.GlobalTracer()),
 		middleware.StreamClientUserHeaderInterceptor,
-		cortex_middleware.PrometheusGRPCStreamInstrumentation(ingesterClientRequestDuration),
+		middleware.StreamClientInstrumentInterceptor(ingesterClientRequestDuration),
 	)
 
 	return unaryInterceptors, streamInterceptors

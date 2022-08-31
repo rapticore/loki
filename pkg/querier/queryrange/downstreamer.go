@@ -3,41 +3,72 @@ package queryrange
 import (
 	"context"
 	"fmt"
-	"time"
 
-	"github.com/cortexproject/cortex/pkg/querier/queryrange"
-	"github.com/cortexproject/cortex/pkg/util/spanlogger"
-	"github.com/go-kit/kit/log/level"
-	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/go-kit/log/level"
+	"github.com/grafana/dskit/tenant"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
 
+	"github.com/grafana/loki/pkg/loghttp"
 	"github.com/grafana/loki/pkg/logql"
 	"github.com/grafana/loki/pkg/logqlmodel"
+	"github.com/grafana/loki/pkg/querier/queryrange/queryrangebase"
+	"github.com/grafana/loki/pkg/util/spanlogger"
 )
 
 const (
-	DefaultDownstreamConcurrency = 32
+	DefaultDownstreamConcurrency = 128
 )
 
 type DownstreamHandler struct {
-	next queryrange.Handler
+	limits Limits
+	next   queryrangebase.Handler
 }
 
-func ParamsToLokiRequest(params logql.Params) *LokiRequest {
+func ParamsToLokiRequest(params logql.Params, shards logql.Shards) queryrangebase.Request {
+	if params.Start().Equal(params.End()) {
+		return &LokiInstantRequest{
+			Query:     params.Query(),
+			Limit:     params.Limit(),
+			TimeTs:    params.Start(),
+			Direction: params.Direction(),
+			Path:      "/loki/api/v1/query", // TODO(owen-d): make this derivable
+			Shards:    shards.Encode(),
+		}
+	}
 	return &LokiRequest{
 		Query:     params.Query(),
 		Limit:     params.Limit(),
-		Step:      int64(params.Step() / time.Millisecond),
+		Step:      params.Step().Milliseconds(),
+		Interval:  params.Interval().Milliseconds(),
 		StartTs:   params.Start(),
 		EndTs:     params.End(),
 		Direction: params.Direction(),
 		Path:      "/loki/api/v1/query_range", // TODO(owen-d): make this derivable
+		Shards:    shards.Encode(),
 	}
 }
 
-func (h DownstreamHandler) Downstreamer() logql.Downstreamer {
+// Note: After the introduction of the LimitedRoundTripper,
+// bounding concurrency in the downstreamer is mostly redundant
+// The reason we don't remove it is to prevent malicious queries
+// from creating an unreasonably large number of goroutines, such as
+// the case of a query like `a / a / a / a / a ..etc`, which could try
+// to shard each leg, quickly dispatching an unreasonable number of goroutines.
+// In the future, it's probably better to replace this with a channel based API
+// so we don't have to do all this ugly edge case handling/accounting
+func (h DownstreamHandler) Downstreamer(ctx context.Context) logql.Downstreamer {
 	p := DefaultDownstreamConcurrency
+
+	// We may increase parallelism above the default,
+	// ensure we don't end up bottlenecking here.
+	if user, err := tenant.TenantID(ctx); err == nil {
+		if x := h.limits.MaxQueryParallelism(user); x > 0 {
+			p = x
+		}
+	}
+
 	locks := make(chan struct{}, p)
 	for i := 0; i < p; i++ {
 		locks <- struct{}{}
@@ -53,15 +84,15 @@ func (h DownstreamHandler) Downstreamer() logql.Downstreamer {
 type instance struct {
 	parallelism int
 	locks       chan struct{}
-	handler     queryrange.Handler
+	handler     queryrangebase.Handler
 }
 
 func (in instance) Downstream(ctx context.Context, queries []logql.DownstreamQuery) ([]logqlmodel.Result, error) {
 	return in.For(ctx, queries, func(qry logql.DownstreamQuery) (logqlmodel.Result, error) {
-		req := ParamsToLokiRequest(qry.Params).WithShards(qry.Shards).WithQuery(qry.Expr.String()).(*LokiRequest)
+		req := ParamsToLokiRequest(qry.Params, qry.Shards).WithQuery(qry.Expr.String())
 		logger, ctx := spanlogger.New(ctx, "DownstreamHandler.instance")
 		defer logger.Finish()
-		level.Debug(logger).Log("shards", fmt.Sprintf("%+v", req.Shards), "query", req.Query, "step", req.GetStep())
+		level.Debug(logger).Log("shards", fmt.Sprintf("%+v", qry.Shards), "query", req.GetQuery(), "step", req.GetStep())
 
 		res, err := in.handler.Do(ctx, req)
 		if err != nil {
@@ -119,17 +150,21 @@ func (in instance) For(
 
 	results := make([]logqlmodel.Result, len(queries))
 	for i := 0; i < len(queries); i++ {
-		resp := <-ch
-		if resp.err != nil {
-			return nil, resp.err
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case resp := <-ch:
+			if resp.err != nil {
+				return nil, resp.err
+			}
+			results[resp.i] = resp.res
 		}
-		results[resp.i] = resp.res
 	}
 	return results, nil
 }
 
 // convert to matrix
-func sampleStreamToMatrix(streams []queryrange.SampleStream) parser.Value {
+func sampleStreamToMatrix(streams []queryrangebase.SampleStream) parser.Value {
 	xs := make(promql.Matrix, 0, len(streams))
 	for _, stream := range streams {
 		x := promql.Series{}
@@ -151,7 +186,26 @@ func sampleStreamToMatrix(streams []queryrange.SampleStream) parser.Value {
 	return xs
 }
 
-func ResponseToResult(resp queryrange.Response) (logqlmodel.Result, error) {
+func sampleStreamToVector(streams []queryrangebase.SampleStream) parser.Value {
+	xs := make(promql.Vector, 0, len(streams))
+	for _, stream := range streams {
+		x := promql.Sample{}
+		x.Metric = make(labels.Labels, 0, len(stream.Labels))
+		for _, l := range stream.Labels {
+			x.Metric = append(x.Metric, labels.Label(l))
+		}
+
+		x.Point = promql.Point{
+			T: stream.Samples[0].TimestampMs,
+			V: stream.Samples[0].Value,
+		}
+
+		xs = append(xs, x)
+	}
+	return xs
+}
+
+func ResponseToResult(resp queryrangebase.Response) (logqlmodel.Result, error) {
 	switch r := resp.(type) {
 	case *LokiResponse:
 		if r.Error != "" {
@@ -173,7 +227,12 @@ func ResponseToResult(resp queryrange.Response) (logqlmodel.Result, error) {
 		if r.Response.Error != "" {
 			return logqlmodel.Result{}, fmt.Errorf("%s: %s", r.Response.ErrorType, r.Response.Error)
 		}
-
+		if r.Response.Data.ResultType == loghttp.ResultTypeVector {
+			return logqlmodel.Result{
+				Statistics: r.Statistics,
+				Data:       sampleStreamToVector(r.Response.Data.Result),
+			}, nil
+		}
 		return logqlmodel.Result{
 			Statistics: r.Statistics,
 			Data:       sampleStreamToMatrix(r.Response.Data.Result),

@@ -1,3 +1,4 @@
+//go:build ignore
 // +build ignore
 
 package main
@@ -6,7 +7,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/prometheus/prometheus/pkg/modtimevfs"
+	"github.com/prometheus/alertmanager/pkg/modtimevfs"
 	"github.com/shurcooL/vfsgen"
 
 	"github.com/grafana/loki/clients/pkg/promtail/server/ui"

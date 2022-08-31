@@ -17,7 +17,6 @@ package wal
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
@@ -25,10 +24,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
 
+	"github.com/prometheus/prometheus/tsdb/chunks"
 	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
 	"github.com/prometheus/prometheus/tsdb/fileutil"
 	"github.com/prometheus/prometheus/tsdb/record"
@@ -40,9 +40,11 @@ type CheckpointStats struct {
 	DroppedSeries     int
 	DroppedSamples    int
 	DroppedTombstones int
+	DroppedExemplars  int
 	TotalSeries       int // Processed series including dropped ones.
 	TotalSamples      int // Processed samples including dropped ones.
 	TotalTombstones   int // Processed tombstones including dropped ones.
+	TotalExemplars    int // Processed exemplars including dropped ones.
 }
 
 // LastCheckpoint returns the directory name and index of the most recent checkpoint.
@@ -80,22 +82,21 @@ func DeleteCheckpoints(dir string, maxIndex int) error {
 
 const checkpointPrefix = "checkpoint."
 
-// Checkpoint creates a compacted checkpoint of segments in range [first, last] in the given WAL.
+// Checkpoint creates a compacted checkpoint of segments in range [from, to] in the given WAL.
 // It includes the most recent checkpoint if it exists.
-// All series not satisfying keep and samples below mint are dropped.
+// All series not satisfying keep and samples/tombstones/exemplars below mint are dropped.
 //
 // The checkpoint is stored in a directory named checkpoint.N in the same
 // segmented format as the original WAL itself.
 // This makes it easy to read it through the WAL package and concatenate
 // it with the original WAL.
-func Checkpoint(logger log.Logger, w *WAL, from, to int, keep func(id uint64) bool, mint int64) (*CheckpointStats, error) {
+func Checkpoint(logger log.Logger, w *WAL, from, to int, keep func(id chunks.HeadSeriesRef) bool, mint int64) (*CheckpointStats, error) {
 	stats := &CheckpointStats{}
 	var sgmReader io.ReadCloser
 
 	level.Info(logger).Log("msg", "Creating checkpoint", "from_segment", from, "to_segment", to, "mint", mint)
 
 	{
-
 		var sgmRange []SegmentRange
 		dir, idx, err := LastCheckpoint(w.Dir())
 		if err != nil && err != record.ErrNotFound {
@@ -127,7 +128,7 @@ func Checkpoint(logger log.Logger, w *WAL, from, to int, keep func(id uint64) bo
 		return nil, errors.Wrap(err, "remove previous temporary checkpoint dir")
 	}
 
-	if err := os.MkdirAll(cpdirtmp, 0777); err != nil {
+	if err := os.MkdirAll(cpdirtmp, 0o777); err != nil {
 		return nil, errors.Wrap(err, "create checkpoint dir")
 	}
 	cp, err := New(nil, nil, cpdirtmp, w.CompressionEnabled())
@@ -144,16 +145,17 @@ func Checkpoint(logger log.Logger, w *WAL, from, to int, keep func(id uint64) bo
 	r := NewReader(sgmReader)
 
 	var (
-		series  []record.RefSeries
-		samples []record.RefSample
-		tstones []tombstones.Stone
-		dec     record.Decoder
-		enc     record.Encoder
-		buf     []byte
-		recs    [][]byte
+		series    []record.RefSeries
+		samples   []record.RefSample
+		tstones   []tombstones.Stone
+		exemplars []record.RefExemplar
+		dec       record.Decoder
+		enc       record.Encoder
+		buf       []byte
+		recs      [][]byte
 	)
 	for r.Next() {
-		series, samples, tstones = series[:0], samples[:0], tstones[:0]
+		series, samples, tstones, exemplars = series[:0], samples[:0], tstones[:0], exemplars[:0]
 
 		// We don't reset the buffer since we batch up multiple records
 		// before writing them to the checkpoint.
@@ -219,6 +221,23 @@ func Checkpoint(logger log.Logger, w *WAL, from, to int, keep func(id uint64) bo
 			stats.TotalTombstones += len(tstones)
 			stats.DroppedTombstones += len(tstones) - len(repl)
 
+		case record.Exemplars:
+			exemplars, err = dec.Exemplars(rec, exemplars)
+			if err != nil {
+				return nil, errors.Wrap(err, "decode exemplars")
+			}
+			// Drop irrelevant exemplars in place.
+			repl := exemplars[:0]
+			for _, e := range exemplars {
+				if e.T >= mint {
+					repl = append(repl, e)
+				}
+			}
+			if len(repl) > 0 {
+				buf = enc.Exemplars(repl, buf)
+			}
+			stats.TotalExemplars += len(exemplars)
+			stats.DroppedExemplars += len(exemplars) - len(repl)
 		default:
 			// Unknown record type, probably from a future Prometheus version.
 			continue
@@ -280,7 +299,7 @@ type checkpointRef struct {
 }
 
 func listCheckpoints(dir string) (refs []checkpointRef, err error) {
-	files, err := ioutil.ReadDir(dir)
+	files, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}

@@ -4,12 +4,13 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"regexp"
 	"testing"
 	"time"
 
-	util_log "github.com/cortexproject/cortex/pkg/util/log"
-	"github.com/go-kit/kit/log"
+	"github.com/go-kit/log"
 	"github.com/opentracing/opentracing-go"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/uber/jaeger-client-go"
 	"github.com/weaveworks/common/user"
@@ -17,6 +18,8 @@ import (
 	"github.com/grafana/loki/pkg/logproto"
 	"github.com/grafana/loki/pkg/logqlmodel"
 	"github.com/grafana/loki/pkg/logqlmodel/stats"
+	"github.com/grafana/loki/pkg/util/httpreq"
+	util_log "github.com/grafana/loki/pkg/util/log"
 )
 
 func TestQueryType(t *testing.T) {
@@ -61,7 +64,10 @@ func TestLogSlowQuery(t *testing.T) {
 	sp := opentracing.StartSpan("")
 	ctx := opentracing.ContextWithSpan(user.InjectOrgID(context.Background(), "foo"), sp)
 	now := time.Now()
-	RecordMetrics(ctx, LiteralParams{
+
+	ctx = context.WithValue(ctx, httpreq.QueryTagsHTTPHeader, "Source=logvolhist,Feature=Beta")
+
+	RecordRangeAndInstantQueryMetrics(ctx, util_log.Logger, LiteralParams{
 		qs:        `{foo="bar"} |= "buzz"`,
 		direction: logproto.BACKWARD,
 		end:       now,
@@ -71,15 +77,113 @@ func TestLogSlowQuery(t *testing.T) {
 	}, "200", stats.Result{
 		Summary: stats.Summary{
 			BytesProcessedPerSecond: 100000,
+			QueueTime:               0.000000002,
 			ExecTime:                25.25,
 			TotalBytesProcessed:     100000,
+			TotalEntriesReturned:    10,
 		},
 	}, logqlmodel.Streams{logproto.Stream{Entries: make([]logproto.Entry, 10)}})
+	require.Regexp(t,
+		regexp.MustCompile(fmt.Sprintf(
+			`level=info org_id=foo traceID=%s latency=slow query=".*" query_type=filter range_type=range length=1h0m0s start_delta=.* end_delta=.* step=1m0s duration=25.25s status=200 limit=1000 returned_lines=10 throughput=100kB total_bytes=100kB total_entries=10 queue_time=2ns subqueries=0 cache_chunk_req=0 cache_chunk_hit=0 cache_chunk_bytes_stored=0 cache_chunk_bytes_fetched=0 cache_index_req=0 cache_index_hit=0 cache_result_req=0 cache_result_hit=0 source=logvolhist feature=beta\n`,
+			sp.Context().(jaeger.SpanContext).SpanID().String(),
+		)),
+		buf.String())
+	util_log.Logger = log.NewNopLogger()
+}
+
+func TestLogLabelsQuery(t *testing.T) {
+	buf := bytes.NewBufferString("")
+	logger := log.NewLogfmtLogger(buf)
+	tr, c := jaeger.NewTracer("foo", jaeger.NewConstSampler(true), jaeger.NewInMemoryReporter())
+	defer c.Close()
+	opentracing.SetGlobalTracer(tr)
+	sp := opentracing.StartSpan("")
+	ctx := opentracing.ContextWithSpan(user.InjectOrgID(context.Background(), "foo"), sp)
+	now := time.Now()
+	RecordLabelQueryMetrics(ctx, logger, now.Add(-1*time.Hour), now, "foo", "200", stats.Result{
+		Summary: stats.Summary{
+			BytesProcessedPerSecond: 100000,
+			ExecTime:                25.25,
+			TotalBytesProcessed:     100000,
+			TotalEntriesReturned:    12,
+		},
+	})
 	require.Equal(t,
 		fmt.Sprintf(
-			"level=info org_id=foo traceID=%s latency=slow query=\"{foo=\\\"bar\\\"} |= \\\"buzz\\\"\" query_type=filter range_type=range length=1h0m0s step=1m0s duration=25.25s status=200 limit=1000 returned_lines=10 throughput=100kB total_bytes=100kB\n",
+			"level=info org_id=foo traceID=%s latency=slow query_type=labels length=1h0m0s duration=25.25s status=200 label=foo throughput=100kB total_bytes=100kB total_entries=12\n",
 			sp.Context().(jaeger.SpanContext).SpanID().String(),
 		),
 		buf.String())
 	util_log.Logger = log.NewNopLogger()
+}
+
+func TestLogSeriesQuery(t *testing.T) {
+	buf := bytes.NewBufferString("")
+	logger := log.NewLogfmtLogger(buf)
+	tr, c := jaeger.NewTracer("foo", jaeger.NewConstSampler(true), jaeger.NewInMemoryReporter())
+	defer c.Close()
+	opentracing.SetGlobalTracer(tr)
+	sp := opentracing.StartSpan("")
+	ctx := opentracing.ContextWithSpan(user.InjectOrgID(context.Background(), "foo"), sp)
+	now := time.Now()
+	RecordSeriesQueryMetrics(ctx, logger, now.Add(-1*time.Hour), now, []string{`{container_name=~"prometheus.*", component="server"}`, `{app="loki"}`}, "200", stats.Result{
+		Summary: stats.Summary{
+			BytesProcessedPerSecond: 100000,
+			ExecTime:                25.25,
+			TotalBytesProcessed:     100000,
+			TotalEntriesReturned:    10,
+		},
+	})
+	require.Equal(t,
+		fmt.Sprintf(
+			"level=info org_id=foo traceID=%s latency=slow query_type=series length=1h0m0s duration=25.25s status=200 match=\"{container_name=~\\\"prometheus.*\\\", component=\\\"server\\\"}:{app=\\\"loki\\\"}\" throughput=100kB total_bytes=100kB total_entries=10\n",
+			sp.Context().(jaeger.SpanContext).SpanID().String(),
+		),
+		buf.String())
+	util_log.Logger = log.NewNopLogger()
+}
+
+func Test_testToKeyValues(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		exp  []interface{}
+	}{
+		{
+			name: "canonical-form",
+			in:   "Source=logvolhist",
+			exp: []interface{}{
+				"source",
+				"logvolhist",
+			},
+		},
+		{
+			name: "canonical-form-multiple-values",
+			in:   "Source=logvolhist,Feature=beta",
+			exp: []interface{}{
+				"source",
+				"logvolhist",
+				"feature",
+				"beta",
+			},
+		},
+		{
+			name: "empty",
+			in:   "",
+			exp:  []interface{}{},
+		},
+		{
+			name: "non-canonical form",
+			in:   "abc",
+			exp:  []interface{}{},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := tagsToKeyValues(c.in)
+			assert.Equal(t, c.exp, got)
+		})
+	}
 }

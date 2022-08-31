@@ -6,3 +6,19 @@ stack_name = "rapticore-loki-promtail"
 s3_prefix = "rapticore-loki-promtail"
 region = "us-west-2"
 capabilities = "CAPABILITY_NAMED_IAM"
+s3_bucket = "aws-sam-cli-managed-default-samclisourcebucket-1xpaswidki200"
+profile = "spring925"
+confirm_changeset = true
+parameter_overrides = "PromtailAddress=\"https://17135:eyJrIjoiMzBlZTg5MWE3YTJkNWMxYzZlMTEzMzQ5NWU2ZmZmOTM0NzQ2YWVmNCIsIm4iOiJsYW1iZGEtcHJvbXRhaWwiLCJpZCI6NDU5ODQxfQ==@logs-prod-us-central1.grafana.net/api/prom/push,TenantId=spring925\" TenantId=\"spring925\" ReservedConcurrency=\"2\""
+
+[spring925]
+[spring925.deploy]
+[spring925.deploy.parameters]
+stack_name = "rapticore-loki-promtail"
+s3_bucket = "aws-sam-cli-managed-default-samclisourcebucket-1xpaswidki200"
+s3_prefix = "rapticore-loki-promtail"
+region = "us-west-2"
+profile = "spring925"
+confirm_changeset = true
+capabilities = "CAPABILITY_NAMED_IAM"
+parameter_overrides = "PromtailAddress=\"https://17135:eyJrIjoiMzBlZTg5MWE3YTJkNWMxYzZlMTEzMzQ5NWU2ZmZmOTM0NzQ2YWVmNCIsIm4iOiJsYW1iZGEtcHJvbXRhaWwiLCJpZCI6NDU5ODQxfQ==@logs-prod-us-central1.grafana.net/api/prom/push,TenantId=spring925\" TenantId=\"spring925\" ReservedConcurrency=\"2\""

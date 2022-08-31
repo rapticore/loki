@@ -124,6 +124,24 @@ Resources:
       DestinationArn: !GetAtt LambdaPromtailFunction.Arn
       FilterPattern: ""
       LogGroupName: "/rapticore/aws-discovery-svc"
+  PolicyEnginePromtailSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      DestinationArn: !GetAtt LambdaPromtailFunction.Arn
+      FilterPattern: ""
+      LogGroupName: "/rapticore/policy-engine-svc"
+  VulnerabilityApiPromtailSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      DestinationArn: !GetAtt LambdaPromtailFunction.Arn
+      FilterPattern: ""
+      LogGroupName: "/rapticore/vulnerability-api-svc"
+  VulnerabilityAppPromtailSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      DestinationArn: !GetAtt LambdaPromtailFunction.Arn
+      FilterPattern: ""
+      LogGroupName: "/rapticore/vulnerability-app-svc"
   ApiGwHttpPromtailSubscriptionFilter:
     Type: AWS::Logs::SubscriptionFilter
     Properties:

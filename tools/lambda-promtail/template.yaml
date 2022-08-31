@@ -10,7 +10,7 @@ Parameters:
     Type: String
     Default: 'http://localhost:8080/loki/api/v1/push'
   ReservedConcurrency:
-    Description: "The maximum of concurrent executions you want to reserve for the function."
+    Description: The maximum of concurrent executions you want to reserve for the function.
     Type: Number
     Default: 2
   Username:
@@ -70,69 +70,14 @@ Resources:
     Properties:
       Code:
         ImageUri: !Ref LambdaPromtailImage
+      Architectures: ["arm64"]  
       MemorySize: 128
       PackageType: Image
       Timeout: 60
-      EventInvokeConfig:
-        MaximumRetryAttempts: 2
-      Policies:
-        - Statement:
-            Effect: Allow
-            Action:
-              - 'logs:DescribeLogGroups'
-              - 'logs:DescribeLogStreams'
-              - 'logs:FilterLogEvents'
-              - 'logs:GetLogEvents'
-            Resource: '*'
+      Role: !GetAtt LambdaPromtailRole.Arn
       ReservedConcurrentExecutions: !Ref ReservedConcurrency
       # # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-lambda-function-vpcconfig.html
       # VpcConfig:
-      Runtime: go1.x
-      Events:
-        WebSvc:
-          Type: CloudWatchLogs
-          Properties:
-            LogGroupName: "/rapticore/web-svc"
-            FilterPattern: ""
-        ApiSvc:
-          Type: CloudWatchLogs
-          Properties:
-            LogGroupName: "/rapticore/api-svc"
-            FilterPattern: ""
-        GitlabDiscovery:
-          Type: CloudWatchLogs
-          Properties:
-            LogGroupName: "/aws/lambda/gitlab-discovery"
-            FilterPattern: ""
-        AwsDiscovery:
-          Type: CloudWatchLogs
-          Properties:
-            LogGroupName: "/rapticore/aws-discovery-svc"
-            FilterPattern: ""
-        SurveyLambda:
-          Type: CloudWatchLogs
-          Properties:
-            LogGroupName: "/aws/lambda/survey-lambda"
-            FilterPattern: ""
-        ApiGwHttp:
-          Type: CloudWatchLogs
-          Properties:
-            LogGroupName:
-              !Join ["-", ["/aws/apigateway/httpapi", !Ref TenantId]]
-            FilterPattern: ""
-        ApiGwRest:
-          Type: CloudWatchLogs
-          Properties:
-            LogGroupName:
-              !Join ["-", ["/aws/apigateway/restapi", !Ref TenantId]]
-            FilterPattern: ""
-        Postgres:
-          Type: CloudWatchLogs
-          Properties:
-            LogGroupName:
-              !Join ["", ["/aws/rds/cluster/rapticore-db-", !Ref TenantId, "/postgresql"]]
-            FilterPattern: ""
-
       Environment: # More info about Env Vars: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#environment-object
         Variables:
           WRITE_ADDRESS: !Ref WriteAddress
@@ -161,12 +106,42 @@ Resources:
       Qualifier: !GetAtt LambdaPromtailVersion.Version
   # Copy this block and modify as required to create Subscription Filters for
   # additional CloudWatch Log Groups.
-  MainLambdaPromtailSubscriptionFilter:
+  WebSvcPromtailSubscriptionFilter:
     Type: AWS::Logs::SubscriptionFilter
     Properties:
       DestinationArn: !GetAtt LambdaPromtailFunction.Arn
       FilterPattern: ""
-      LogGroupName: "/aws/lambda/some-lamda-log-group"
+      LogGroupName: "/rapticore/web-svc"
+  ApiSvcPromtailSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      DestinationArn: !GetAtt LambdaPromtailFunction.Arn
+      FilterPattern: ""
+      LogGroupName: "/rapticore/api-svc"
+  AwsDiscoveryPromtailSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      DestinationArn: !GetAtt LambdaPromtailFunction.Arn
+      FilterPattern: ""
+      LogGroupName: "/rapticore/aws-discovery-svc"
+  ApiGwHttpPromtailSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      DestinationArn: !GetAtt LambdaPromtailFunction.Arn
+      FilterPattern: ""
+      LogGroupName: !Join ["-", ["/aws/apigateway/httpapi", !Ref TenantID]]
+  ApiGwRestPromtailSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      DestinationArn: !GetAtt LambdaPromtailFunction.Arn
+      FilterPattern: ""
+      LogGroupName: !Join ["-", ["/aws/apigateway/restapi", !Ref TenantID]]
+  RdsPromtailSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      DestinationArn: !GetAtt LambdaPromtailFunction.Arn
+      FilterPattern: ""
+      LogGroupName: !Join ["", ["/aws/rds/cluster/rapticore-db-", !Ref TenantID, "/postgresql"]]
 
 Outputs:
   LambdaPromtailFunction:

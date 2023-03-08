@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"strconv"
@@ -367,7 +366,7 @@ func relabelConfig(config string, lbs model.LabelSet) (model.LabelSet, error) {
 	if err := yaml.UnmarshalStrict([]byte(config), &relabelConfig); err != nil {
 		return nil, err
 	}
-	relabed := relabel.Process(labels.FromMap(util.ModelLabelSetToMap(lbs)), relabelConfig...)
+	relabed, _ := relabel.Process(labels.FromMap(util.ModelLabelSetToMap(lbs)), relabelConfig...)
 	return model.LabelSet(util.LabelsToMetric(relabed)), nil
 }
 
@@ -385,7 +384,7 @@ func parseBoolean(key string, logCtx logger.Info, defaultValue bool) (bool, erro
 
 // loadConfig read YAML-formatted config from filename into cfg.
 func loadConfig(filename string, cfg interface{}) error {
-	buf, err := ioutil.ReadFile(filename)
+	buf, err := os.ReadFile(filename)
 	if err != nil {
 		return errors.Wrap(err, "Error reading config file")
 	}

@@ -1,12 +1,11 @@
-//go:build linux && cgo
-// +build linux,cgo
+//go:build linux && cgo && promtail_journal_enabled
+// +build linux,cgo,promtail_journal_enabled
 
 package journal
 
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"strings"
 	"syscall"
 	"time"
@@ -201,7 +200,7 @@ func journalTargetWithReader(
 
 	go func() {
 		for {
-			err := t.r.Follow(until, ioutil.Discard)
+			err := t.r.Follow(until, io.Discard)
 			if err != nil {
 				level.Error(t.logger).Log("msg", "received error during sdjournal follow", "err", err.Error())
 
@@ -305,7 +304,7 @@ func (t *JournalTarget) formatter(entry *sdjournal.JournalEntry) (string, error)
 		entryLabels[string(k)] = string(v)
 	}
 
-	processedLabels := relabel.Process(labels.FromMap(entryLabels), t.relabelConfig...)
+	processedLabels, _ := relabel.Process(labels.FromMap(entryLabels), t.relabelConfig...)
 
 	processedLabelsMap := processedLabels.Map()
 	labels := make(model.LabelSet, len(processedLabelsMap))

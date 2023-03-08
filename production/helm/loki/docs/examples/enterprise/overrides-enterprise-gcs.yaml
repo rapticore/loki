@@ -1,7 +1,5 @@
-enterprise: 
+enterprise:
   enabled: true
-  adminApi:
-    enabled: true
   useExternalLicense: true
   externalLicenseName: gel-secrets
   tokengen:
@@ -16,28 +14,12 @@ enterprise:
         secret:
           secretName: gel-secrets
           items:
-          - key: gel-license.jwt
+          - key: license.jwt
             path: license.jwt
           - key: gcp_service_account.json
             path: gcp_service_account.json
-  config: |
-    admin_client:
-      storage:
-        gcs:
-          bucket_name: {YOUR_GCS_BUCKET}
-    auth:
-      type: enterprise
-    auth_enabled: true
-    cluster_name: enterprise-logs
-    license:
-      path: /etc/gel_secrets/license.jwt
-
 loki:
-  authEnabled: true
-
-  commonConfig:
-    path_prefix: /var/loki
-    replication_factor: 3
+  auth_enabled: true
 
   storage:
     type: gcs
@@ -61,7 +43,7 @@ write:
       secret:
         secretName: gel-secrets
         items:
-        - key: gel-license.jwt
+        - key: license.jwt
           path: license.jwt
         - key: gcp_service_account.json
           path: gcp_service_account.json
@@ -78,7 +60,7 @@ read:
       secret:
         secretName: gel-secrets
         items:
-        - key: gel-license.jwt
+        - key: license.jwt
           path: license.jwt
         - key: gcp_service_account.json
           path: gcp_service_account.json
@@ -95,7 +77,7 @@ gateway:
       secret:
         secretName: gel-secrets
         items:
-        - key: gel-license.jwt
+        - key: license.jwt
           path: license.jwt
         - key: gcp_service_account.json
           path: gcp_service_account.json

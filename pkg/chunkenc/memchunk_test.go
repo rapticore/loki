@@ -68,9 +68,9 @@ func TestBlocksInclusive(t *testing.T) {
 
 func TestBlock(t *testing.T) {
 	for _, enc := range testEncoding {
+		enc := enc
 		t.Run(enc.String(), func(t *testing.T) {
 			t.Parallel()
-
 			chk := NewMemChunk(enc, DefaultHeadBlockFmt, testBlockSize, testTargetSize)
 			cases := []struct {
 				ts  int64
@@ -178,6 +178,39 @@ func TestBlock(t *testing.T) {
 	}
 }
 
+func TestCorruptChunk(t *testing.T) {
+	for _, enc := range testEncoding {
+		enc := enc
+		t.Run(enc.String(), func(t *testing.T) {
+			t.Parallel()
+
+			chk := NewMemChunk(enc, DefaultHeadBlockFmt, testBlockSize, testTargetSize)
+			cases := []struct {
+				data []byte
+			}{
+				// Data that should not decode as lines from a chunk in any encoding.
+				{data: []byte{0}},
+				{data: []byte{1}},
+				{data: []byte("asdfasdfasdfqwyteqwtyeq")},
+			}
+
+			ctx, start, end := context.Background(), time.Unix(0, 0), time.Unix(0, math.MaxInt64)
+			for i, c := range cases {
+				chk.blocks = []block{{b: c.data}}
+				it, err := chk.Iterator(ctx, start, end, logproto.FORWARD, noopStreamPipeline)
+				require.NoError(t, err, "case %d", i)
+
+				idx := 0
+				for it.Next() {
+					idx++
+				}
+				require.Error(t, it.Error(), "case %d", i)
+				require.NoError(t, it.Close())
+			}
+		})
+	}
+}
+
 func TestReadFormatV1(t *testing.T) {
 	t.Parallel()
 
@@ -219,6 +252,8 @@ func TestRoundtripV2(t *testing.T) {
 	for _, f := range HeadBlockFmts {
 		for _, enc := range testEncoding {
 			for _, version := range []byte{chunkFormatV2, chunkFormatV3} {
+				enc := enc
+				version := version
 				t.Run(enc.String(), func(t *testing.T) {
 					t.Parallel()
 
@@ -276,6 +311,7 @@ func TestRoundtripV2(t *testing.T) {
 func TestRoundtripV3(t *testing.T) {
 	for _, f := range HeadBlockFmts {
 		for _, enc := range testEncoding {
+			enc := enc
 			t.Run(fmt.Sprintf("%v-%v", f, enc), func(t *testing.T) {
 				t.Parallel()
 
@@ -299,6 +335,7 @@ func TestRoundtripV3(t *testing.T) {
 func TestSerialization(t *testing.T) {
 	for _, f := range HeadBlockFmts {
 		for _, enc := range testEncoding {
+			enc := enc
 			t.Run(enc.String(), func(t *testing.T) {
 				t.Parallel()
 
@@ -350,6 +387,7 @@ func TestSerialization(t *testing.T) {
 func TestChunkFilling(t *testing.T) {
 	for _, f := range HeadBlockFmts {
 		for _, enc := range testEncoding {
+			enc := enc
 			t.Run(enc.String(), func(t *testing.T) {
 				t.Parallel()
 
@@ -643,11 +681,7 @@ func TestIteratorClose(t *testing.T) {
 	}
 }
 
-var result []Chunk
-
 func BenchmarkWrite(b *testing.B) {
-	chunks := []Chunk{}
-
 	entry := &logproto.Entry{
 		Timestamp: time.Unix(0, 0),
 		Line:      testdata.LogString(0),
@@ -657,6 +691,7 @@ func BenchmarkWrite(b *testing.B) {
 	for _, f := range HeadBlockFmts {
 		for _, enc := range testEncoding {
 			b.Run(fmt.Sprintf("%v-%v", f, enc), func(b *testing.B) {
+				uncompressedBytes, compressedBytes := 0, 0
 				for n := 0; n < b.N; n++ {
 					c := NewMemChunk(enc, f, testBlockSize, testTargetSize)
 					// adds until full so we trigger cut which serialize using gzip
@@ -666,9 +701,11 @@ func BenchmarkWrite(b *testing.B) {
 						entry.Line = testdata.LogString(i)
 						i++
 					}
-					chunks = append(chunks, c)
+					uncompressedBytes += c.UncompressedSize()
+					compressedBytes += c.CompressedSize()
 				}
-				result = chunks
+				b.SetBytes(int64(uncompressedBytes) / int64(b.N))
+				b.ReportMetric(float64(compressedBytes)/float64(uncompressedBytes)*100, "%compressed")
 			})
 		}
 	}
@@ -685,23 +722,17 @@ func (nomatchPipeline) ProcessString(_ int64, line string) (string, log.LabelsRe
 }
 
 func BenchmarkRead(b *testing.B) {
-	type res struct {
-		name  string
-		speed float64
-	}
-	result := []res{}
 	for _, bs := range testBlockSizes {
 		for _, enc := range testEncoding {
 			name := fmt.Sprintf("%s_%s", enc.String(), humanize.Bytes(uint64(bs)))
 			b.Run(name, func(b *testing.B) {
 				chunks, size := generateData(enc, 5, bs, testTargetSize)
+				_, ctx := stats.NewContext(context.Background())
 				b.ResetTimer()
-				bytesRead := uint64(0)
-				now := time.Now()
 				for n := 0; n < b.N; n++ {
 					for _, c := range chunks {
 						// use forward iterator for benchmark -- backward iterator does extra allocations by keeping entries in memory
-						iterator, err := c.Iterator(context.Background(), time.Unix(0, 0), time.Now(), logproto.FORWARD, nomatchPipeline{})
+						iterator, err := c.Iterator(ctx, time.Unix(0, 0), time.Now(), logproto.FORWARD, nomatchPipeline{})
 						if err != nil {
 							panic(err)
 						}
@@ -712,24 +743,23 @@ func BenchmarkRead(b *testing.B) {
 							b.Fatal(err)
 						}
 					}
-					bytesRead += size
 				}
-				result = append(result, res{
-					name:  name,
-					speed: float64(bytesRead) / time.Since(now).Seconds(),
-				})
+				b.SetBytes(int64(size))
 			})
+		}
+	}
 
-			name = fmt.Sprintf("sample_%s_%s", enc.String(), humanize.Bytes(uint64(bs)))
-
+	for _, bs := range testBlockSizes {
+		for _, enc := range testEncoding {
+			name := fmt.Sprintf("sample_%s_%s", enc.String(), humanize.Bytes(uint64(bs)))
 			b.Run(name, func(b *testing.B) {
 				chunks, size := generateData(enc, 5, bs, testTargetSize)
+				_, ctx := stats.NewContext(context.Background())
 				b.ResetTimer()
 				bytesRead := uint64(0)
-				now := time.Now()
 				for n := 0; n < b.N; n++ {
 					for _, c := range chunks {
-						iterator := c.SampleIterator(context.Background(), time.Unix(0, 0), time.Now(), countExtractor)
+						iterator := c.SampleIterator(ctx, time.Unix(0, 0), time.Now(), countExtractor)
 						for iterator.Next() {
 							_ = iterator.Sample()
 						}
@@ -739,18 +769,9 @@ func BenchmarkRead(b *testing.B) {
 					}
 					bytesRead += size
 				}
-				result = append(result, res{
-					name:  name,
-					speed: float64(bytesRead) / time.Since(now).Seconds(),
-				})
+				b.SetBytes(int64(bytesRead) / int64(b.N))
 			})
 		}
-	}
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].speed > result[j].speed
-	})
-	for _, r := range result {
-		fmt.Printf("%s: %.2f MB/s\n", r.name, r.speed/1024/1024)
 	}
 }
 
@@ -878,34 +899,26 @@ func TestMemChunk_IteratorBounds(t *testing.T) {
 		expect     []bool // array of expected values for next call in sequence
 	}{
 		{time.Unix(0, 0), time.Unix(0, 1), logproto.FORWARD, []bool{false}},
-		{time.Unix(0, 1), time.Unix(0, 1), logproto.FORWARD, []bool{true, false}},
 		{time.Unix(0, 1), time.Unix(0, 2), logproto.FORWARD, []bool{true, false}},
-		{time.Unix(0, 2), time.Unix(0, 2), logproto.FORWARD, []bool{true, false}},
 		{time.Unix(0, 1), time.Unix(0, 3), logproto.FORWARD, []bool{true, true, false}},
 		{time.Unix(0, 2), time.Unix(0, 3), logproto.FORWARD, []bool{true, false}},
-		{time.Unix(0, 3), time.Unix(0, 3), logproto.FORWARD, []bool{false}},
 
 		{time.Unix(0, 0), time.Unix(0, 1), logproto.BACKWARD, []bool{false}},
-		{time.Unix(0, 1), time.Unix(0, 1), logproto.BACKWARD, []bool{true, false}},
 		{time.Unix(0, 1), time.Unix(0, 2), logproto.BACKWARD, []bool{true, false}},
-		{time.Unix(0, 2), time.Unix(0, 2), logproto.BACKWARD, []bool{true, false}},
 		{time.Unix(0, 1), time.Unix(0, 3), logproto.BACKWARD, []bool{true, true, false}},
 		{time.Unix(0, 2), time.Unix(0, 3), logproto.BACKWARD, []bool{true, false}},
-		{time.Unix(0, 3), time.Unix(0, 3), logproto.BACKWARD, []bool{false}},
 	} {
 		t.Run(
 			fmt.Sprintf("mint:%d,maxt:%d,direction:%s", tt.mint.UnixNano(), tt.maxt.UnixNano(), tt.direction),
 			func(t *testing.T) {
-				t.Parallel()
-
 				tt := tt
 				c := createChunk()
 
 				// testing headchunk
 				it, err := c.Iterator(context.Background(), tt.mint, tt.maxt, tt.direction, noopStreamPipeline)
 				require.NoError(t, err)
-				for i := range tt.expect {
-					require.Equal(t, tt.expect[i], it.Next())
+				for idx, expected := range tt.expect {
+					require.Equal(t, expected, it.Next(), "idx: %s", idx)
 				}
 				require.NoError(t, it.Close())
 
@@ -923,6 +936,7 @@ func TestMemChunk_IteratorBounds(t *testing.T) {
 
 func TestMemchunkLongLine(t *testing.T) {
 	for _, enc := range testEncoding {
+		enc := enc
 		t.Run(enc.String(), func(t *testing.T) {
 			t.Parallel()
 
@@ -1238,7 +1252,7 @@ func TestMemChunk_ReboundAndFilter_with_filter(t *testing.T) {
 	chkThrough := chkFrom.Add(10 * time.Second)
 	chkThroughPlus1 := chkThrough.Add(1 * time.Second)
 
-	filterFunc := func(in string) bool {
+	filterFunc := func(_ time.Time, in string) bool {
 		return strings.HasPrefix(in, "matching")
 	}
 

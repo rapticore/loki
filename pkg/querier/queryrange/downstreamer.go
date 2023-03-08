@@ -64,7 +64,7 @@ func (h DownstreamHandler) Downstreamer(ctx context.Context) logql.Downstreamer 
 	// We may increase parallelism above the default,
 	// ensure we don't end up bottlenecking here.
 	if user, err := tenant.TenantID(ctx); err == nil {
-		if x := h.limits.MaxQueryParallelism(user); x > 0 {
+		if x := h.limits.MaxQueryParallelism(ctx, user); x > 0 {
 			p = x
 		}
 	}
@@ -221,6 +221,7 @@ func ResponseToResult(resp queryrangebase.Response) (logqlmodel.Result, error) {
 		return logqlmodel.Result{
 			Statistics: r.Statistics,
 			Data:       streams,
+			Headers:    resp.GetHeaders(),
 		}, nil
 
 	case *LokiPromResponse:
@@ -231,11 +232,13 @@ func ResponseToResult(resp queryrangebase.Response) (logqlmodel.Result, error) {
 			return logqlmodel.Result{
 				Statistics: r.Statistics,
 				Data:       sampleStreamToVector(r.Response.Data.Result),
+				Headers:    resp.GetHeaders(),
 			}, nil
 		}
 		return logqlmodel.Result{
 			Statistics: r.Statistics,
 			Data:       sampleStreamToMatrix(r.Response.Data.Result),
+			Headers:    resp.GetHeaders(),
 		}, nil
 
 	default:

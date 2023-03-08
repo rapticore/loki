@@ -505,7 +505,7 @@ func TestQuerier_concurrentTailLimits(t *testing.T) {
 				mockQuerierConfig(),
 				mockIngesterClientConfig(),
 				newIngesterClientMockFactory(ingesterClient),
-				newReadRingMock(testData.ringIngesters),
+				newReadRingMock(testData.ringIngesters, 0),
 				&mockDeleteGettter{},
 				store, limits)
 			require.NoError(t, err)
@@ -1014,8 +1014,12 @@ type fakeTimeLimits struct {
 	maxQueryLength   time.Duration
 }
 
-func (f fakeTimeLimits) MaxQueryLookback(_ string) time.Duration { return f.maxQueryLookback }
-func (f fakeTimeLimits) MaxQueryLength(_ string) time.Duration   { return f.maxQueryLength }
+func (f fakeTimeLimits) MaxQueryLookback(_ context.Context, _ string) time.Duration {
+	return f.maxQueryLookback
+}
+func (f fakeTimeLimits) MaxQueryLength(_ context.Context, _ string) time.Duration {
+	return f.maxQueryLength
+}
 
 func Test_validateQueryTimeRangeLimits(t *testing.T) {
 	now := time.Now()

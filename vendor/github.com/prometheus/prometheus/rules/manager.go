@@ -15,6 +15,8 @@ package rules
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"math"
 	"net/url"
 	"sort"
@@ -23,20 +25,23 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/rulefmt"
 	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/model/value"
+	"github.com/prometheus/prometheus/notifier"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"github.com/prometheus/prometheus/util/strutil"
 )
 
 // RuleHealth describes the health state of a rule.
@@ -198,7 +203,7 @@ func EngineQueryFunc(engine *promql.Engine, q storage.Queryable) QueryFunc {
 			return v, nil
 		case promql.Scalar:
 			return promql.Vector{promql.Sample{
-				Point:  promql.Point(v),
+				Point:  promql.Point{T: v.T, V: v.V},
 				Metric: labels.Labels{},
 			}}, nil
 		default:
@@ -630,7 +635,8 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 
 				// Canceled queries are intentional termination of queries. This normally
 				// happens on shutdown and thus we skip logging of any errors here.
-				if _, ok := err.(promql.ErrQueryCanceled); !ok {
+				var eqc promql.ErrQueryCanceled
+				if !errors.As(err, &eqc) {
 					level.Warn(g.logger).Log("name", rule.Name(), "index", i, "msg", "Evaluating rule failed", "rule", rule, "err", err)
 				}
 				return
@@ -644,6 +650,7 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 			}
 			var (
 				numOutOfOrder = 0
+				numTooOld     = 0
 				numDuplicates = 0
 			)
 
@@ -663,16 +670,31 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 			}()
 
 			for _, s := range vector {
-				if _, err := app.Append(0, s.Metric, s.T, s.V); err != nil {
+				if s.H != nil {
+					// We assume that all native histogram results are gauge histograms.
+					// TODO(codesome): once PromQL can give the counter reset info, remove this assumption.
+					s.H.CounterResetHint = histogram.GaugeType
+					_, err = app.AppendHistogram(0, s.Metric, s.T, nil, s.H)
+				} else {
+					_, err = app.Append(0, s.Metric, s.T, s.V)
+				}
+
+				if err != nil {
 					rule.SetHealth(HealthBad)
 					rule.SetLastError(err)
 					sp.SetStatus(codes.Error, err.Error())
-
-					switch errors.Cause(err) {
-					case storage.ErrOutOfOrderSample:
+					unwrappedErr := errors.Unwrap(err)
+					if unwrappedErr == nil {
+						unwrappedErr = err
+					}
+					switch {
+					case errors.Is(unwrappedErr, storage.ErrOutOfOrderSample):
 						numOutOfOrder++
 						level.Debug(g.logger).Log("name", rule.Name(), "index", i, "msg", "Rule evaluation result discarded", "err", err, "sample", s)
-					case storage.ErrDuplicateSampleForTimestamp:
+					case errors.Is(unwrappedErr, storage.ErrTooOldSample):
+						numTooOld++
+						level.Debug(g.logger).Log("name", rule.Name(), "index", i, "msg", "Rule evaluation result discarded", "err", err, "sample", s)
+					case errors.Is(unwrappedErr, storage.ErrDuplicateSampleForTimestamp):
 						numDuplicates++
 						level.Debug(g.logger).Log("name", rule.Name(), "index", i, "msg", "Rule evaluation result discarded", "err", err, "sample", s)
 					default:
@@ -686,6 +708,9 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 			if numOutOfOrder > 0 {
 				level.Warn(g.logger).Log("name", rule.Name(), "index", i, "msg", "Error on ingesting out-of-order result from rule evaluation", "numDropped", numOutOfOrder)
 			}
+			if numTooOld > 0 {
+				level.Warn(g.logger).Log("name", rule.Name(), "index", i, "msg", "Error on ingesting too old result from rule evaluation", "numDropped", numTooOld)
+			}
 			if numDuplicates > 0 {
 				level.Warn(g.logger).Log("name", rule.Name(), "index", i, "msg", "Error on ingesting results from rule evaluation with different value but same timestamp", "numDropped", numDuplicates)
 			}
@@ -694,9 +719,15 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 				if _, ok := seriesReturned[metric]; !ok {
 					// Series no longer exposed, mark it stale.
 					_, err = app.Append(0, lset, timestamp.FromTime(ts), math.Float64frombits(value.StaleNaN))
-					switch errors.Cause(err) {
-					case nil:
-					case storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp:
+					unwrappedErr := errors.Unwrap(err)
+					if unwrappedErr == nil {
+						unwrappedErr = err
+					}
+					switch {
+					case unwrappedErr == nil:
+					case errors.Is(unwrappedErr, storage.ErrOutOfOrderSample),
+						errors.Is(unwrappedErr, storage.ErrTooOldSample),
+						errors.Is(unwrappedErr, storage.ErrDuplicateSampleForTimestamp):
 						// Do not count these in logging, as this is expected if series
 						// is exposed from a different rule.
 					default:
@@ -720,9 +751,15 @@ func (g *Group) cleanupStaleSeries(ctx context.Context, ts time.Time) {
 	for _, s := range g.staleSeries {
 		// Rule that produced series no longer configured, mark it stale.
 		_, err := app.Append(0, s, timestamp.FromTime(ts), math.Float64frombits(value.StaleNaN))
-		switch errors.Cause(err) {
-		case nil:
-		case storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp:
+		unwrappedErr := errors.Unwrap(err)
+		if unwrappedErr == nil {
+			unwrappedErr = err
+		}
+		switch {
+		case unwrappedErr == nil:
+		case errors.Is(unwrappedErr, storage.ErrOutOfOrderSample),
+			errors.Is(unwrappedErr, storage.ErrTooOldSample),
+			errors.Is(unwrappedErr, storage.ErrDuplicateSampleForTimestamp):
 			// Do not count these in logging, as this is expected if series
 			// is exposed from a different rule.
 		default:
@@ -791,8 +828,8 @@ func (g *Group) RestoreForState(ts time.Time) {
 			// Series found for the 'for' state.
 			var t int64
 			var v float64
-			it := s.Iterator()
-			for it.Next() {
+			it := s.Iterator(nil)
+			for it.Next() == chunkenc.ValFloat {
 				t, v = it.At()
 			}
 			if it.Err() != nil {
@@ -1074,7 +1111,7 @@ func (m *Manager) LoadGroups(
 			for _, r := range rg.Rules {
 				expr, err := m.opts.GroupLoader.Parse(r.Expr.Value)
 				if err != nil {
-					return nil, []error{errors.Wrap(err, fn)}
+					return nil, []error{fmt.Errorf("%s: %w", fn, err)}
 				}
 
 				if r.Alert.Value != "" {
@@ -1082,6 +1119,7 @@ func (m *Manager) LoadGroups(
 						r.Alert.Value,
 						expr,
 						time.Duration(r.For),
+						time.Duration(r.KeepFiringFor),
 						labels.FromMap(r.Labels),
 						labels.FromMap(r.Annotations),
 						externalLabels,
@@ -1163,4 +1201,34 @@ func (m *Manager) AlertingRules() []*AlertingRule {
 	}
 
 	return alerts
+}
+
+type Sender interface {
+	Send(alerts ...*notifier.Alert)
+}
+
+// SendAlerts implements the rules.NotifyFunc for a Notifier.
+func SendAlerts(s Sender, externalURL string) NotifyFunc {
+	return func(ctx context.Context, expr string, alerts ...*Alert) {
+		var res []*notifier.Alert
+
+		for _, alert := range alerts {
+			a := &notifier.Alert{
+				StartsAt:     alert.FiredAt,
+				Labels:       alert.Labels,
+				Annotations:  alert.Annotations,
+				GeneratorURL: externalURL + strutil.TableLinkForExpression(expr),
+			}
+			if !alert.ResolvedAt.IsZero() {
+				a.EndsAt = alert.ResolvedAt
+			} else {
+				a.EndsAt = alert.ValidUntil
+			}
+			res = append(res, a)
+		}
+
+		if len(alerts) > 0 {
+			s.Send(res...)
+		}
+	}
 }

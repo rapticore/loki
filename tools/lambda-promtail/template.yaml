@@ -83,7 +83,6 @@ Resources:
     Properties:
       Code:
         ImageUri: !Ref LambdaPromtailImage
-      Architectures: ["arm64"]  
       MemorySize: 128
       PackageType: Image
       Timeout: 60
@@ -146,6 +145,12 @@ Resources:
       DestinationArn: !GetAtt LambdaPromtailFunction.Arn
       FilterPattern: ""
       LogGroupName: "/rapticore/policy-engine-svc"
+  AnalyticsEnginePromtailSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      DestinationArn: !GetAtt LambdaPromtailFunction.Arn
+      FilterPattern: ""
+      LogGroupName: "/rapticore/analytics-engine-svc"
   VulnerabilityApiPromtailSubscriptionFilter:
     Type: AWS::Logs::SubscriptionFilter
     Properties:

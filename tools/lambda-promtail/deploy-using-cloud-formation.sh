@@ -4,10 +4,10 @@ AWS_PROFILE=rednight5978
 AWS_ACCOUNT_ID=457598610614
 
 aws ecr get-login-password --region us-west-2 --profile $AWS_PROFILE | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.us-west-2.amazonaws.com
-# Update this image to whatever latest is avaibale in ECR
-docker pull public.ecr.aws/grafana/lambda-promtail:main-1c3f5d0-arm64
 
-docker tag public.ecr.aws/grafana/lambda-promtail:main-1c3f5d0-arm64 $AWS_ACCOUNT_ID.dkr.ecr.us-west-2.amazonaws.com/rapticore/lambda-promtail:latest
+docker build  -t rapticore/lambda-promtail . -f tools/lambda-promtail/Dockerfile
+
+docker tag rapticore/lambda-promtail $AWS_ACCOUNT_ID.dkr.ecr.us-west-2.amazonaws.com/rapticore/lambda-promtail:latest
 
 docker push $AWS_ACCOUNT_ID.dkr.ecr.us-west-2.amazonaws.com/rapticore/lambda-promtail:latest
 
